@@ -1,0 +1,17 @@
+# Virtual workspace manifest.
+#
+# Its only job is to make the two Rust crates (`abi/` and `rust/`) discoverable as
+# workspace members so they can be resolved by package name from a Cargo git
+# dependency, e.g.
+#   propify-sandbox-abi = { git = "...", tag = "v0.1.0", package = "propify-sandbox-abi" }
+#
+# It deliberately declares NO `[workspace.package]` or `[workspace.dependencies]`:
+# the member crates were de-worked to concrete, self-contained values on purpose
+# (a creator cloning just one crate must be able to read and build it standalone),
+# and they must stay that way. This root manifest only groups them for discovery.
+#
+# The `assemblyscript/` and `tinygo/` directories are not Cargo crates and are not
+# members of this workspace.
+[workspace]
+resolver = "2"
+members = ["abi", "rust"]

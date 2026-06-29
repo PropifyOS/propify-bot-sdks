@@ -257,6 +257,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "propify-bot-sdk"
+version = "0.1.0-BETA.1"
+dependencies = [
+ "propify-sandbox-abi",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
 name = "propify-sandbox-abi"
 version = "0.1.0-BETA.1"
 dependencies = [
