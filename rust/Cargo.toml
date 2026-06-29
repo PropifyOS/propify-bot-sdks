@@ -1,0 +1,41 @@
+[package]
+name = "propify-bot-sdk"
+# Concrete package metadata so this crate builds standalone in this repository.
+# Licensed Apache-2.0, the public SDK license.
+version = "0.1.0-BETA.1"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+# This crate is the creator-facing guest SDK. It genuinely needs FFI `unsafe` to call
+# the host capability imports and to hand the host buffers in the guest's own linear
+# memory, so it cannot adopt `unsafe_code = "forbid"`. Instead it sets its own `deny`:
+# all `unsafe` is confined to the wasm32-only `ffi` module, which scopes a single
+# `#[allow(unsafe_code)]` over its `// SAFETY:`-documented blocks. Creator-facing code
+# (the `Bot` trait, the read/emit driver) stays 100% safe.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+
+[dependencies]
+# The ONLY dependency: the shared codec (DTOs, the six enums, `CodecError`). Inside
+# this repository the sibling `abi/` crate resolves by path. Taken with the abi crate's
+# default features, which leave its `serde` feature OFF, so a guest compiled to wasm
+# never pulls serde.
+propify-sandbox-abi = { path = "../abi" }
+
+[dev-dependencies]
+# The off-target unit tests build `OrderIntentBody` values with exact decimals and
+# drive the read/emit flow against a mock host. Test-only; never on the guest path.
+# `rust_decimal` is also used by the `minimal_bot` example.
+rust_decimal = "1"
+rust_decimal_macros = "1"
+
+# A minimal starting-point bot a creator can copy. It is a `cdylib` so that
+# `cargo build --example minimal_bot --target wasm32-unknown-unknown --release`
+# emits a real guest `.wasm` module, the same artifact shape a creator publishes.
+[[example]]
+name = "minimal_bot"
+crate-type = ["cdylib"]

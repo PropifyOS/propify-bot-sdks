@@ -1,0 +1,13 @@
+{
+  "//": "Editor/tooling config for AssemblyScript. The authoritative reproducible build recipe lives in build-repro.sh (single source of truth, also run by package.json's build:sample and sdks/repro-check.sh); the options here mirror it so an `asc` invocation without explicit flags still produces the same load-compatible module. Keeping `runtime: stub` and the abort override here prevents an IDE build from accidentally injecting host imports (env.abort) the frozen ABI forbids. `converge` and shrinkLevel 1 mirror the reproducible recipe; no `debug`/`sourceMap` so no absolute-path sourceMappingURL leaks into the artifact.",
+  "entries": ["assembly/sample.ts"],
+  "options": {
+    "runtime": "stub",
+    "exportRuntime": false,
+    "use": ["abort=assembly/noop/propifyAbort"],
+    "noAssert": true,
+    "optimizeLevel": 3,
+    "shrinkLevel": 1,
+    "converge": true
+  }
+}

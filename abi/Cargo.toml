@@ -1,0 +1,39 @@
+[package]
+name = "propify-sandbox-abi"
+# Concrete package metadata so this crate builds standalone in this repository.
+# Licensed Apache-2.0, the public SDK license.
+version = "0.1.0-BETA.1"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+# This crate is 100% safe code shared by the host and every guest SDK, so it stays on
+# the `unsafe_code = "forbid"` policy.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[features]
+# `serde` is OFF by default so a wasm guest SDK never pulls serde. Enabling it turns
+# on serde for this crate's own types AND for `rust_decimal` (which we depend on with
+# default features off, so its serde is otherwise absent), so a host that wants to
+# serialize `Decimal` stays correct.
+serde = ["dep:serde", "rust_decimal/serde"]
+
+[dependencies]
+# The canonical money type, carried on the wire as (i128 mantissa, i32 scale) so no
+# `f64` ever touches the boundary. Pure Rust, builds on wasm32-unknown-unknown.
+# `default-features = false` drops `rust_decimal`'s default `serde` so a wasm guest
+# stays serde-free; only `std` is kept. The `serde` feature above re-enables
+# `rust_decimal/serde` for a host that opts in.
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+# The typed `CodecError`. thiserror v2 is no_std-friendly and builds on wasm.
+thiserror = "2"
+# Optional: only the six enums opt into serde, behind the `serde` feature.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+# Ergonomic `dec!()` literals for the codec round-trip tests. Test-only.
+rust_decimal_macros = "1"

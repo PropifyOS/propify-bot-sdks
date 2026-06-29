@@ -1,0 +1,8 @@
+# Compiled wasm artifacts. The sample.wasm the host gate loads is a CI-built
+# artifact, mirroring how the Rust and AssemblyScript sample .wasm files are built in
+# CI and never committed.
+build/
+
+# TinyGo intermediate build directory. TinyGo writes its temporary build files here
+# (TMPDIR/GOTMPDIR are pointed at it) so nothing lands on the RAM-backed /tmp tmpfs.
+.tinygo-tmp/

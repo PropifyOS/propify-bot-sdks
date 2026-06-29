@@ -1,0 +1,18 @@
+{
+  "name": "@propifyos/bot-sdk-assemblyscript",
+  "version": "0.1.0-beta.1",
+  "private": true,
+  "description": "AssemblyScript guest SDK for the PropifyOS bot sandbox (ABI v2 multi-candle window).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "build": "bash build-repro.sh",
+    "build:sample": "bash build-repro.sh",
+    "build:debug": "asc assembly/sample.ts --outFile build/sample.debug.wasm --textFile build/sample.debug.wat --runtime stub --use abort=assembly/noop/propifyAbort --debug",
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "assemblyscript": "0.28.19"
+  }
+}

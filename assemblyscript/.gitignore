@@ -1,0 +1,6 @@
+# Installed dependencies (restored by `pnpm install`).
+node_modules/
+
+# Compiled wasm artifacts. The `sample.wasm` the host gate loads is a CI-built
+# artifact, mirroring how the Rust sample .wasm is built in CI and never committed.
+build/

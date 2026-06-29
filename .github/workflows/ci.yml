@@ -1,0 +1,104 @@
+# CI for the public bot SDK repository.
+#
+# It does two things the public surface requires (spec section 9): it secret-scans the
+# repository, and it builds all three SDKs from a clean checkout so a broken build is
+# caught before anyone depends on it.
+#
+# Action pinning: every action is pinned to a full commit SHA (the strongest
+# supply-chain pin), with a trailing `# vX.Y.Z` comment recording the release that SHA
+# corresponds to. `dtolnay/rust-toolchain` has no semver release; its `stable` ref is
+# pinned to its current commit and the actual Rust version is set by `toolchain:` below.
+# To update an action, resolve the new tag to its commit SHA and replace both.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate the repository on a secret scan. A finding fails the run.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for a complete scan)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Rust: build the abi crate and the guest SDK, and compile the example to a real
+  # wasm32 guest module.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust 1.95 with the wasm target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - name: Test the abi crate
+        working-directory: abi
+        run: cargo test --locked
+      - name: Test the Rust SDK (host target)
+        working-directory: rust
+        run: cargo test --locked
+      - name: Build the example to wasm32
+        working-directory: rust
+        run: cargo build --locked --example minimal_bot --target wasm32-unknown-unknown --release
+
+  # AssemblyScript: install from the frozen lockfile, build the reproducible artifact,
+  # and run the SDK tests.
+  assemblyscript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: assemblyscript/pnpm-lock.yaml
+      - name: Install wasm-tools (used by the reproducible build)
+        run: cargo install wasm-tools --version 1.252.0 --locked
+      - name: Install dependencies
+        working-directory: assemblyscript
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        working-directory: assemblyscript
+        run: pnpm build
+      - name: Test
+        working-directory: assemblyscript
+        run: pnpm test
+
+  # TinyGo: run the host-side decoder tests, then build the sample with the pinned
+  # TinyGo and normalize it.
+  tinygo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.24"
+      - name: Host-side tests
+        working-directory: tinygo
+        run: go test ./...
+      - uses: acifani/setup-tinygo@db56321a62b9a67922bb9ac8f9d085e218807bb3 # v2.0.1
+        with:
+          tinygo-version: "0.41.1"
+          install-binaryen: "true"
+      - name: Install wasm-tools (used by the reproducible build)
+        run: cargo install wasm-tools --version 1.252.0 --locked
+      - name: Build the sample
+        working-directory: tinygo
+        run: ./build-repro.sh
