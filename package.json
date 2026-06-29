@@ -1,0 +1,19 @@
+{
+  "name": "propify-bot-sdks",
+  "version": "0.1.1",
+  "description": "PropifyOS bot SDKs (AssemblyScript, Rust, TinyGo) and the shared ABI v2 wire format. Consumable as a git dependency so an external AssemblyScript bot can import the AssemblyScript SDK from propify-bot-sdks/assemblyscript/assembly/index.",
+  "license": "Apache-2.0",
+  "private": false,
+  "files": [
+    "assemblyscript/",
+    "abi/",
+    "rust/",
+    "tinygo/",
+    "docs/",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "!**/target/**",
+    "!**/build/**"
+  ]
+}
