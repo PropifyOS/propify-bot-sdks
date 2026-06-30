@@ -44,7 +44,7 @@ pnpm install --frozen-lockfile
 mkdir -p "${script_dir}/build"
 
 # Compile with the pinned reproducible flags. `runtime stub` and the `abort` override keep
-# the module on the frozen v1 ABI (no `env.abort` host import).
+# the module on the frozen v3 ABI (no `env.abort` host import).
 pnpm exec asc assembly/sample.ts \
   --outFile "${raw_wasm}" \
   --runtime stub \

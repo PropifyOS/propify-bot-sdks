@@ -5,9 +5,8 @@ supported languages (Rust, AssemblyScript, TinyGo) but no prior knowledge of
 WebAssembly internals. The SDK handles the boundary.
 
 This guide covers the complete creator API: the execution model, the data your bot
-receives and returns, the exact decimal money format, both the v1 single-candle
-snapshot and the v2 multi-candle window, the ABI contract for advanced readers, and
-the per-language build instructions.
+receives and returns, the exact decimal money format, the ABI contract for advanced
+readers, and the per-language build instructions.
 
 ---
 
@@ -16,8 +15,9 @@ the per-language build instructions.
 A bot is a WebAssembly module compiled for `wasm32`. The PropifyOS sandbox host
 (backed by Wasmtime) loads the module, calls it once per market tick, and tears it
 down. The module receives a read-only snapshot of the latest market candle, a bounded
-window of recent candles (ABI v2), the strategy's configuration parameters, and the
-account's current figures. It then returns at most one order intent or nothing.
+window of recent candles, the strategy's configuration parameters, the account's
+current figures, and a read-only account context with the resolved rule set. It then
+returns at most one order intent or nothing.
 
 ---
 
@@ -56,30 +56,27 @@ see past candles without keeping state.
 
 Because the guest has no clock and no randomness, identical inputs must produce
 identical emitted bytes. This is not a soft expectation; it is the property that makes
-a live bot's behaviour reproducible in a backtest. The v2 window does not change this:
-the window is past candles supplied by the host, so it adds history without adding
-non-determinism. Write your decision logic as a pure function of the inputs you
-receive.
+a live bot's behaviour reproducible in a backtest. The window and the account context
+do not change this: both are produced and supplied by the host, so identical tick
+inputs always yield identical host-supplied bytes. Write your decision logic as a pure
+function of the inputs you receive.
 
 ---
 
-## ABI versions: v1 and v2
+## ABI version: v3
 
-`ABI_VERSION` is `2`. Your guest reports the version it targets through its
-`abi_version()` export, which the SDK sets for you.
+`ABI_VERSION` is `3`. Your guest reports the version it targets through its
+`abi_version()` export, which the SDK sets for you. The host accepts only guests that
+report `3`; the prior v1 and v2 support is dropped.
 
-- **v1** hands the guest a single latest candle (`MarketSnapshot`), the strategy
-  parameters, and the account view. This is enough for any bot whose decision depends
-  only on the current price and the account's standing.
-- **v2** adds one capability, `host_read_market_window`, which serves a bounded,
-  time-ordered window of recent candles (`MarketWindow`). A multi-candle indicator
-  (a moving average, a momentum measure) is recomputed from that window each tick
-  rather than accumulated in guest state.
+v3 defines the complete input surface: the single-candle snapshot, the multi-candle
+window, the strategy parameters, the account view, and the read-only account context.
+The window and the account context are part of the contract; a simple bot ignores them
+without any version branching. Every v3 bot also embeds a manifest inside the artifact;
+see "Bot manifest" in "The data your bot receives" below.
 
-The host supports both side by side. A v1 guest never sees the window and runs exactly
-as before. A v2 guest may read it. All three SDKs in this repository target v2 and
-expose the window read, and they keep the snapshot read for simple bots. Reading the
-window is optional: a snapshot-only bot simply ignores it.
+Reading the window or the account context is optional for individual bots: a
+snapshot-only bot simply ignores both.
 
 ---
 
@@ -102,7 +99,7 @@ A single market observation: the latest candle for one asset.
 | `close`        | `Decimal` | Close price.                                                                |
 | `volume`       | `Decimal` | Traded volume over the candle.                                             |
 
-### MarketWindow (ABI v2)
+### MarketWindow
 
 The asset and a bounded, time-ordered array of recent candles, oldest to newest,
 ending with the latest. Each candle carries `timestamp_ms` and the same five OHLCV
@@ -142,6 +139,53 @@ any other account.
 
 `exposure` is the lever that lets a stateless bot know where it already stands, so it
 can emit the difference toward a target rather than tracking its own past orders.
+
+### AccountContext
+
+The read-only account rule set and lifecycle status for this tick.
+
+| Field                 | Type                         | Description                                                                                              |
+|-----------------------|------------------------------|----------------------------------------------------------------------------------------------------------|
+| `status`              | `AccountStatus`              | `Evaluation` (0) or `Funded` (1).                                                                        |
+| `daily_loss_limit`    | `Decimal`                    | Fixed daily loss allowance, in account currency.                                                         |
+| `daily_loss_floor`    | `Decimal`                    | Host-computed equity level at which today's loss limit is breached.                                      |
+| `drawdown`            | `DrawdownRule`               | The resolved drawdown rule (see below).                                                                  |
+| `default_leverage`    | `Decimal`                    | Default maximum leverage.                                                                                |
+| `leverage_overrides`  | list of (asset_class, cap)   | Per-asset-class leverage caps, for example BTC 5x. Count-prefixed list.                                  |
+| `allowed_instruments` | list of string               | Permitted asset symbols. Count-prefixed list.                                                            |
+| `profit_target`       | optional `Decimal`           | Absolute equity level the account must reach to pass an evaluation. `None`/`null` when the account is Funded (a funded account carries no profit target). |
+
+`DrawdownRule` fields:
+
+| Field            | Type           | Description                                                                                                           |
+|------------------|----------------|-----------------------------------------------------------------------------------------------------------------------|
+| `kind`           | `DrawdownKind` | `Static` (0) for 1-step tiers; `Trailing` (1) for 2-step tiers.                                                      |
+| `limit`          | `Decimal`      | Drawdown allowance.                                                                                                   |
+| `floor`          | `Decimal`      | Host-computed current drawdown floor. For a trailing account this already reflects the high-water mark.               |
+| `high_water_mark`| `Decimal`      | Host-computed high-water mark. Use `floor` for risk decisions; `high_water_mark` is for display or logging.           |
+
+The in-bot rules are for adaptation only. The host risk gate enforces every limit
+regardless of what the bot reads or emits; a bot that ignores the context cannot exceed
+any limit.
+
+### Bot manifest
+
+Every v3 bot embeds a manifest as a `propify_manifest` WebAssembly custom section
+inside the artifact. The host extracts and validates it at submission; the manifest
+fields are hashed as part of `ArtifactId` (sha256 of the module bytes), so the
+manifest cannot be changed without changing the content address.
+
+The manifest carries: `name`, `description`, `version` (semver), `license` (SPDX
+identifier), optional `image_sha256` (content hash of a separately uploaded 512x512
+PNG), `author_name`, `author_email`, `author_erc20` (EIP-55 checksummed address), and
+`source_repo_url` (an `https` URL).
+
+How the section is emitted differs per language. In Rust, the toolchain emits it
+natively: add a `build.rs` that builds a `BotManifest`, calls `.encode()`, and writes
+the bytes to `$OUT_DIR/propify_manifest.bin`, then call `declare_manifest!()` in the
+bot alongside `register_bot!`. In AssemblyScript and TinyGo there is no portable
+link-section attribute, so the section is injected after the build with the
+`manifest-encoder` tool; see `tools/manifest-encoder/README.md`.
 
 ---
 
@@ -222,7 +266,7 @@ one, has the wrong type, or has the wrong signature.
 | Export        | Kind     | Signature      | Notes                                                                              |
 |---------------|----------|----------------|------------------------------------------------------------------------------------|
 | `memory`      | memory   | linear memory  | Auto-exported by `cdylib` Rust crates and by the `wasm-unknown` TinyGo target.     |
-| `abi_version` | function | `() -> i32`    | Returns `2` for this SDK generation. The host calls it before any tick.            |
+| `abi_version` | function | `() -> i32`    | Returns `3`. The host calls it before any tick and refuses a guest that returns any other value. |
 | `alloc`       | function | `(i32) -> i32` | `(size) -> ptr`. Reserves a buffer the host writes inputs into. `0` means failure. |
 | `dealloc`     | function | `(i32, i32)`   | `(ptr, size)`. Releases a buffer from `alloc`.                                      |
 | `on_tick`     | function | `() -> ()`     | The entry point, called once per tick after version negotiation.                   |
@@ -232,16 +276,18 @@ one, has the wrong type, or has the wrong signature.
 The host grants these capabilities, all in the `propify` import namespace. Any other
 import, including any WASI import, causes the host to refuse the module at load time.
 
-| Import                               | Signature             | Description                                              |
-|--------------------------------------|-----------------------|----------------------------------------------------------|
-| `propify::host_read_market_data`     | `(ptr, len) -> i32`   | Reads the encoded latest `MarketSnapshot`.               |
-| `propify::host_read_market_window`   | `(ptr, len) -> i32`   | Reads the encoded `MarketWindow` (ABI v2).               |
-| `propify::host_read_strategy_params` | `(ptr, len) -> i32`   | Reads the encoded `StrategyParams`.                      |
-| `propify::host_read_account_view`    | `(ptr, len) -> i32`   | Reads the encoded `AccountView`.                         |
-| `propify::host_emit_intent`          | `(ptr, len) -> i32`   | Offers the encoded `OrderIntentBody` to the host.        |
+| Import                                   | Signature             | Description                                              |
+|------------------------------------------|-----------------------|----------------------------------------------------------|
+| `propify::host_read_market_data`         | `(ptr, len) -> i32`   | Reads the encoded latest `MarketSnapshot`.               |
+| `propify::host_read_market_window`       | `(ptr, len) -> i32`   | Reads the encoded `MarketWindow`.                        |
+| `propify::host_read_strategy_params`     | `(ptr, len) -> i32`   | Reads the encoded `StrategyParams`.                      |
+| `propify::host_read_account_view`        | `(ptr, len) -> i32`   | Reads the encoded `AccountView`.                         |
+| `propify::host_read_account_context`     | `(ptr, len) -> i32`   | Reads the encoded `AccountContext` for this tick (v3).   |
+| `propify::host_emit_intent`              | `(ptr, len) -> i32`   | Offers the encoded `OrderIntentBody` to the host.        |
 
-A snapshot-only bot never calls `host_read_market_window`. The SDKs read it for you
-when the bot is window-aware.
+A snapshot-only bot never calls `host_read_market_window` or
+`host_read_account_context`. The SDKs read both for you when the bot is window- or
+context-aware.
 
 ### Read protocol
 
@@ -306,9 +352,9 @@ implement the `Bot` trait, and register it with `register_bot!`:
 
 ```rust
 use propify_bot_sdk::{
-    register_bot, AccountView, Bot, Exchange, MarketSnapshot, MarketWindow,
+    AccountContext, AccountView, Bot, Exchange, MarketSnapshot, MarketWindow,
     OrderIntentBody, OrderSide, OrderType, PositionSide, ProductType, StrategyParams,
-    TimeInForce,
+    TimeInForce, declare_manifest, register_bot,
 };
 use rust_decimal::Decimal;
 
@@ -318,9 +364,10 @@ impl Bot for MyBot {
     fn on_tick(
         &mut self,
         market: &MarketSnapshot,
-        _window: &MarketWindow, // a snapshot-only bot ignores the window
+        _window: &MarketWindow,
         params: &StrategyParams,
         _account: &AccountView,
+        _context: &AccountContext,
     ) -> Option<OrderIntentBody> {
         let quantity = params
             .params
@@ -346,6 +393,7 @@ impl Bot for MyBot {
 }
 
 register_bot!(MyBot);
+declare_manifest!();
 ```
 
 `register_bot!` accepts a unit struct name (`register_bot!(MyBot)`) or a constructor
@@ -354,6 +402,11 @@ compiling for `target_arch = "wasm32"`. Building for the host target (for exampl
 `cargo test`) produces no FFI exports, so your decision logic stays unit-testable
 off-target. Because the host re-instantiates the module per tick, the macro constructs
 a fresh bot for every `on_tick` call; there is no cross-tick state.
+
+`declare_manifest!()` embeds the `propify_manifest` custom section into the artifact.
+It reads the encoded bytes from `$OUT_DIR/propify_manifest.bin`, which a small
+`build.rs` in the bot crate writes. Add `propify-sandbox-abi` under
+`[build-dependencies]` and copy the `build.rs` from `rust/build.rs` as your template.
 
 This repository ships this bot as a runnable example at
 [`rust/examples/minimal_bot.rs`](../rust/examples/minimal_bot.rs).
@@ -403,6 +456,7 @@ import {
   MarketWindow,
   StrategyParams,
   AccountView,
+  AccountContext,
   OrderIntentBody,
   Decimal,
   Exchange,
@@ -423,9 +477,10 @@ const QUANTITY_NAME: StaticArray<u8> = [113, 117, 97, 110, 116, 105, 116, 121];
 class MyBot extends Bot {
   onTick(
     market: MarketSnapshot,
-    window: MarketWindow, // a snapshot-only bot ignores the window
+    window: MarketWindow,
     params: StrategyParams,
-    account: AccountView
+    account: AccountView,
+    context: AccountContext
   ): OrderIntentBody | null {
     const found = params.find(QUANTITY_NAME);
     const quantity = found !== null ? found : Decimal.fromI64(1, 3); // 0.001
@@ -516,9 +571,10 @@ var orderBody propify.OrderIntentBody
 
 func (MyBot) OnTick(
     market *propify.MarketSnapshot,
-    window *propify.MarketWindow, // a snapshot-only bot ignores the window
+    window *propify.MarketWindow,
     params *propify.StrategyParams,
     account *propify.AccountView,
+    context *propify.AccountContext,
 ) *propify.OrderIntentBody {
     quantity, ok := params.Find(quantityName)
     if !ok {

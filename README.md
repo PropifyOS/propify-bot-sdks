@@ -21,9 +21,9 @@ the module, calls it once per market candle, and tears it down. On each call the
 reads its inputs and returns at most one order, or nothing.
 
 The model in one paragraph: the host calls your bot once per candle. Your bot reads
-the latest candle (and, under ABI v2, a bounded window of recent candles), the
-strategy parameters set when the bot was deployed, and the account's own figures. It
-returns `Some(order)` to act or `None` to wait. It has no clock beyond the candle
+the latest candle, a bounded window of recent candles, the strategy parameters set
+when the bot was deployed, the account's own figures, and a read-only account context
+with the resolved rule set. It returns `Some(order)` to act or `None` to wait. It has no clock beyond the candle
 timestamp, no network, no filesystem, no randomness, and no memory that survives to
 the next tick. The only way to know history is the window the host hands you. This is
 what makes a bot's live behaviour reproducible in a backtest: identical inputs always
@@ -42,18 +42,16 @@ whole surface at once.
 
 ### Versions
 
-`ABI_VERSION` is `2`. A guest reports the version it targets through its
-`abi_version()` export. The host supports v1 and v2 side by side: a v1 guest never
-sees the candle window and runs exactly as before, a v2 guest may read it. All three
-SDKs in this repository target v2 and expose the window read, and they keep the
-single-snapshot read for simple bots.
+`ABI_VERSION` is `3`. A guest reports the version it targets through its
+`abi_version()` export, which must return `3`. The host accepts only v3 guests; the
+prior v1 and v2 support is dropped. All three SDKs in this repository target v3.
 
 ### Required exports (the host checks these at load)
 
 | Export        | Signature       | Notes                                                        |
 |---------------|-----------------|--------------------------------------------------------------|
 | `memory`      | linear memory   | The host reads and writes guest memory through this.         |
-| `abi_version` | `() -> i32`     | Returns `2` for this SDK generation. The host calls it first.|
+| `abi_version` | `() -> i32`     | Returns `3`. The host calls it first and refuses a guest that returns any other value.|
 | `alloc`       | `(i32) -> i32`  | `(size) -> ptr`. Reserves a buffer; returns `0` on failure.  |
 | `dealloc`     | `(i32, i32)`    | `(ptr, size)`. Releases a buffer from `alloc`.               |
 | `on_tick`     | `() -> ()`      | The entry point, called once per tick.                       |
@@ -65,17 +63,18 @@ any WASI import, causes the host to refuse the module at load time.
 
 | Import                              | Signature               | Description                                        |
 |-------------------------------------|-------------------------|----------------------------------------------------|
-| `propify::host_read_market_data`    | `(ptr, len) -> i32`     | Reads the latest `MarketSnapshot` (v1 and v2).     |
-| `propify::host_read_market_window`  | `(ptr, len) -> i32`     | Reads the `MarketWindow` of recent candles (v2).   |
-| `propify::host_read_strategy_params`| `(ptr, len) -> i32`     | Reads the `StrategyParams`.                        |
-| `propify::host_read_account_view`   | `(ptr, len) -> i32`     | Reads this account's `AccountView`.                |
-| `propify::host_emit_intent`         | `(ptr, len) -> i32`     | Offers one encoded `OrderIntentBody` to the host.  |
+| `propify::host_read_market_data`        | `(ptr, len) -> i32`     | Reads the latest `MarketSnapshot`.                     |
+| `propify::host_read_market_window`      | `(ptr, len) -> i32`     | Reads the `MarketWindow` of recent candles.            |
+| `propify::host_read_strategy_params`    | `(ptr, len) -> i32`     | Reads the `StrategyParams`.                            |
+| `propify::host_read_account_view`       | `(ptr, len) -> i32`     | Reads this account's `AccountView`.                    |
+| `propify::host_read_account_context`    | `(ptr, len) -> i32`     | Reads the read-only `AccountContext` for this tick.    |
+| `propify::host_emit_intent`             | `(ptr, len) -> i32`     | Offers one encoded `OrderIntentBody` to the host.      |
 
 ### The inputs
 
 - `MarketSnapshot`: the asset, `timestamp_ms`, and the latest OHLCV candle. All a
   simple bot needs.
-- `MarketWindow` (v2): the asset and a bounded, time-ordered array of recent candles,
+- `MarketWindow`: the asset and a bounded, time-ordered array of recent candles,
   oldest to newest, ending with the latest. Capped at 256 candles. During live
   warm-up, before that many candles exist, the window is shorter and may be empty; a
   window-aware bot must tolerate a short window.
@@ -83,6 +82,32 @@ any WASI import, causes the host to refuse the module at load time.
   configuration. Look values up by name, not position.
 - `AccountView`: `equity`, `available_margin`, `exposure`, and `unrealized_pnl` for
   this account only. No account id and no peer data ever cross the boundary.
+- `AccountContext` (v3): the account's lifecycle status (`Evaluation` or `Funded`), the
+  daily loss limit and its host-computed floor, a `DrawdownRule` (kind, limit, current
+  floor, high-water mark), the default leverage cap, per-asset-class leverage overrides,
+  the list of allowed instruments, and an optional `profit_target` (the absolute equity
+  level the account must reach to pass an evaluation; `None` when the account is
+  Funded). Read this to shape your bot's behaviour within its account's constraints.
+  The host risk gate enforces the same limits regardless; the context is for adaptation,
+  not for trust.
+
+### The bot manifest
+
+Every v3 bot embeds a manifest as a `propify_manifest` WebAssembly custom section
+inside the artifact. The host extracts and validates it at submission; the manifest
+fields are hashed as part of `ArtifactId` (sha256 of the module bytes), so the
+manifest cannot be changed without changing the content address.
+
+The manifest carries: `name`, `description`, `version` (semver), `license` (SPDX
+identifier), optional `image_sha256` (content hash of a separately uploaded 512x512
+PNG), `author_name`, `author_email`, `author_erc20` (EIP-55 checksummed), and
+`source_repo_url`.
+
+In Rust, the SDK emits the section natively: add a `build.rs` that encodes a
+`BotManifest` and writes the bytes to `$OUT_DIR/propify_manifest.bin`, then call
+`declare_manifest!()` in the bot alongside `register_bot!`. In AssemblyScript and
+TinyGo, the section is injected after the build with the `manifest-encoder` tool (see
+`tools/manifest-encoder/README.md`).
 
 ### The output
 

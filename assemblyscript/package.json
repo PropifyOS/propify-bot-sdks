@@ -1,8 +1,8 @@
 {
   "name": "@propifyos/bot-sdk-assemblyscript",
-  "version": "0.1.0-beta.1",
+  "version": "0.2.0",
   "private": true,
-  "description": "AssemblyScript guest SDK for the PropifyOS bot sandbox (ABI v2 multi-candle window).",
+  "description": "AssemblyScript guest SDK for the PropifyOS bot sandbox (ABI v3 multi-candle window and account context).",
   "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@11.9.0",

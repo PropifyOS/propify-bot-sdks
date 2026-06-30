@@ -2,7 +2,7 @@
 name = "propify-sandbox-abi"
 # Concrete package metadata so this crate builds standalone in this repository.
 # Licensed Apache-2.0, the public SDK license.
-version = "0.1.0-BETA.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"

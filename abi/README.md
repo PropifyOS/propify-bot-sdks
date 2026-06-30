@@ -11,13 +11,19 @@ with the round-trip tests here.
 
 ## What it defines
 
-- `ABI_VERSION` (currently `2`).
-- The boundary DTOs: `MarketSnapshot`, `MarketWindow` and `Candle` (ABI v2),
-  `StrategyParams`, `AccountView`, and `OrderIntentBody`.
-- The six wire enums with their frozen discriminants: `Exchange`, `ProductType`,
-  `OrderSide`, `PositionSide`, `OrderType`, `TimeInForce`.
+- `ABI_VERSION` (currently `3`).
+- The boundary DTOs: `MarketSnapshot`, `MarketWindow` and `Candle` (added in v2),
+  `StrategyParams`, `AccountView`, `OrderIntentBody`, `BotManifest` (v3 embedded
+  artifact manifest), `AccountContext` with its `DrawdownRule` sub-shape (v3
+  read-only account rule set passed each tick).
+- The eight wire enums with their frozen discriminants: `Exchange`, `ProductType`,
+  `OrderSide`, `PositionSide`, `OrderType`, `TimeInForce`, `AccountStatus`
+  (v3: `Evaluation` = 0, `Funded` = 1), `DrawdownKind` (v3: `Static` = 0,
+  `Trailing` = 1).
 - The encode and decode functions and `CodecError`.
-- The size bounds: `MAX_MESSAGE_BYTES` (64 KiB) and `MAX_CANDLE_COUNT` (256).
+- The size bounds: `MAX_MESSAGE_BYTES` (64 KiB), `MAX_CANDLE_COUNT` (256),
+  `MAX_MANIFEST_BYTES` (8 KiB), `MAX_LEVERAGE_OVERRIDE_COUNT` (64),
+  `MAX_ALLOWED_INSTRUMENT_COUNT` (1024).
 
 ## Build and test
 

@@ -89,7 +89,7 @@ func (SampleBot) OnTick(
 // `unreachable` unless `_initialize` (or `_start`) has run first to set the runtime's
 // `initializeCalled` flag. The host calls neither — its contract is `abi_version`
 // then `on_tick`, with `alloc`/`dealloc` as signature-checked exports — so every
-// `//go:wasmexport` entry, even `abi_version`'s `return 2`, would trap before any of our
+// `//go:wasmexport` entry, even `abi_version`'s `return 3`, would trap before any of our
 // code runs. `//export` emits a plain wasm export with no such guard, which is exactly what
 // a host that does not drive the reactor lifecycle needs. This is sound only because the
 // guest never touches the Go heap or any state that `_initialize` would set up (see the
