@@ -45,6 +45,8 @@
 //! - `OrderType`: `Market` = 0, `Limit` = 1, `StopMarket` = 2, `StopLimit` = 3,
 //!   `TakeProfitMarket` = 4, `TakeProfitLimit` = 5
 //! - `TimeInForce`: `Gtc` = 0, `Ioc` = 1, `Fok` = 2, `Gtx` = 3
+//! - `AccountStatus` (ABI v3): `Evaluation` = 0, `Funded` = 1
+//! - `DrawdownKind` (ABI v3): `Static` = 0, `Trailing` = 1
 //!
 //! # Message layouts
 //!
@@ -67,6 +69,20 @@
 //!   stamps the `intent_id` from its tick context when it lifts the body into a
 //!   full `OrderIntent` (done host-side in `propify-sandbox`, which owns the
 //!   `OrderIntent` type and the `Ulid` clock the guest is denied).
+//! - **`AccountContext`** (ABI v3): `status: AccountStatus`, `daily_loss_limit:
+//!   Decimal`, `daily_loss_floor: Decimal`, then the inline `DrawdownRule` (`kind:
+//!   DrawdownKind`, `limit: Decimal`, `floor: Decimal`, `high_water_mark: Decimal`),
+//!   `default_leverage: Decimal`, a `u32`-count-prefixed `leverage_overrides` list of
+//!   `(asset_class: String, cap: Decimal)` pairs, and a `u32`-count-prefixed
+//!   `allowed_instruments` list of `String`s. The host resolves and encodes it per
+//!   tick; the guest only ever reads the resolved snapshot.
+//! - **`BotManifest`** (ABI v3): `name: String`, `description: String`, `version:
+//!   String`, `license: String`, `image_sha256: Option<[u8; 32]>` (tag byte then 32
+//!   raw bytes when present), `author_name: String`, `author_email: String`,
+//!   `author_erc20: String`, `source_repo_url: String`. The SDK emits it at build time
+//!   into the `propify_manifest` custom section; the codec does a structural decode
+//!   with per-field byte caps only. Semantic validation (semver, SPDX, EIP-55, URL,
+//!   email) lives marketplace-side, not here.
 //!
 //! # Host-function protocol (the five capabilities)
 //!
@@ -88,7 +104,10 @@
 //! and requires the buffer to be **fully consumed**, rejecting trailing bytes
 //! ([`CodecError::TrailingBytes`]) so no guest can append hidden data.
 
-use crate::enums::{Exchange, OrderSide, OrderType, PositionSide, ProductType, TimeInForce};
+use crate::enums::{
+    AccountStatus, DrawdownKind, Exchange, OrderSide, OrderType, PositionSide, ProductType,
+    TimeInForce,
+};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -119,6 +138,74 @@ const MAX_PARAM_COUNT: usize = 1024;
 /// the asset string + the count prefix is ~28.7 KiB, well below the 64 KiB cap. An
 /// over-cap count is rejected up front, exactly as the strategy-parameter count is.
 pub const MAX_CANDLE_COUNT: usize = 256;
+
+/// Cap on the encoded [`BotManifest`] section payload, in bytes (ABI v3).
+///
+/// 8 KiB, well under the 1 MiB per-custom-section scanner cap. It is exported so the
+/// monorepo static scanner can refuse an oversize `propify_manifest` section *before*
+/// it ever calls [`BotManifest::decode`]; the codec's own backstop stays the 64 KiB
+/// [`MAX_MESSAGE_BYTES`] enforced by every top-level decode. The codec does not
+/// enforce this cap itself — keeping the manifest decode a dumb structural read.
+pub const MAX_MANIFEST_BYTES: usize = 8 * 1024;
+
+// --- Per-field byte caps for the v3 BotManifest (decode-side, structural only) -----
+//
+// These bound each manifest string before its bytes are read, mirroring the existing
+// `MAX_STRING_BYTES` discipline. They are the structural byte caps only: semantic
+// validation (semver, SPDX, EIP-55, URL, email) is a marketplace concern and lives
+// host-side, not in this codec. Two fields exceed the global `MAX_STRING_BYTES` of
+// 1024 (`description`) so the codec reads manifest strings via `read_string_capped`.
+
+/// `name` cap: a human-readable bot name fits comfortably in 100 bytes.
+const MAX_MANIFEST_NAME_BYTES: usize = 100;
+
+/// `description` cap: a short description, the one field that exceeds the global
+/// `MAX_STRING_BYTES` (1024), so `read_string_capped` is required for it.
+const MAX_MANIFEST_DESCRIPTION_BYTES: usize = 2000;
+
+/// `version` cap: the design gives no explicit cap for the semver string; 64 bytes is
+/// safe headroom for any valid `MAJOR.MINOR.PATCH` plus pre-release/build metadata.
+const MAX_MANIFEST_VERSION_BYTES: usize = 64;
+
+/// `license` cap: a single SPDX identifier is short; 64 bytes is ample.
+const MAX_MANIFEST_LICENSE_BYTES: usize = 64;
+
+/// `author_name` cap: a self-declared author name, same bound as `name`.
+const MAX_MANIFEST_AUTHOR_NAME_BYTES: usize = 100;
+
+/// `author_email` cap: 254 bytes, the maximum length of an email address.
+const MAX_MANIFEST_AUTHOR_EMAIL_BYTES: usize = 254;
+
+/// `author_erc20` cap: 42 bytes (`0x` plus 40 hex digits). The exact-length and
+/// EIP-55 checksum checks are semantic and run marketplace-side; here it is a byte cap.
+const MAX_MANIFEST_AUTHOR_ERC20_BYTES: usize = 42;
+
+/// `source_repo_url` cap: 512 bytes for the https repository link.
+const MAX_MANIFEST_SOURCE_REPO_URL_BYTES: usize = 512;
+
+// --- Bounds for the v3 AccountContext lists (decode-side) --------------------------
+
+/// Cap on the number of `(asset_class, cap)` leverage overrides in an
+/// [`AccountContext`].
+///
+/// The Propr rulebook defines leverage at the asset-class level — BTC/ETH perps,
+/// other-crypto perps, equities perps, commodities perps — so only a handful of
+/// classes ever appear. 64 is generous headroom over that ~4-class reality while still
+/// bounding the decode loop deterministically; an over-cap count is rejected up front.
+const MAX_LEVERAGE_OVERRIDE_COUNT: usize = 64;
+
+/// Cap on the number of `allowed_instruments` in an [`AccountContext`].
+///
+/// Allowed markets are the Hyperliquid perpetual futures; 1024 bounds the list well
+/// above the current venue's instrument count and matches the [`MAX_PARAM_COUNT`]
+/// discipline. An over-cap count is rejected up front.
+const MAX_ALLOWED_INSTRUMENT_COUNT: usize = 1024;
+
+/// Cap on a leverage-override `asset_class` string, in bytes.
+///
+/// Asset-class keys (for example `"BTC"`, `"crypto"`, `"equities"`) are short; 64
+/// bytes rejects an absurd length prefix while accepting every rulebook class.
+const MAX_ASSET_CLASS_BYTES: usize = 64;
 
 /// Why an encoded boundary message could not be decoded.
 ///
@@ -270,12 +357,23 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Reads a `String` capped at the global [`MAX_STRING_BYTES`].
     fn read_string(&mut self) -> Result<String, CodecError> {
+        self.read_string_capped(MAX_STRING_BYTES)
+    }
+
+    /// Reads a `String` whose byte length is capped at a caller-supplied `max`.
+    ///
+    /// The global [`read_string`](Self::read_string) caps at [`MAX_STRING_BYTES`]
+    /// (1024); the v3 manifest needs both larger fields (`description` up to 2000) and
+    /// tighter per-field caps, so the cap is a parameter here. An over-cap length
+    /// prefix is rejected as [`CodecError::Oversized`] before any bytes are read.
+    fn read_string_capped(&mut self, max: usize) -> Result<String, CodecError> {
         let len = self.read_u32()? as usize;
-        if len > MAX_STRING_BYTES {
+        if len > max {
             return Err(CodecError::Oversized {
                 size: len,
-                limit: MAX_STRING_BYTES,
+                limit: max,
             });
         }
         let raw = self.read_slice(len)?;
@@ -381,6 +479,40 @@ impl<'a> Cursor<'a> {
             }),
         }
     }
+
+    fn read_account_status(&mut self) -> Result<AccountStatus, CodecError> {
+        match self.read_u8()? {
+            0 => Ok(AccountStatus::Evaluation),
+            1 => Ok(AccountStatus::Funded),
+            value => Err(CodecError::UnknownDiscriminant {
+                kind: "AccountStatus",
+                value,
+            }),
+        }
+    }
+
+    fn read_drawdown_kind(&mut self) -> Result<DrawdownKind, CodecError> {
+        match self.read_u8()? {
+            0 => Ok(DrawdownKind::Static),
+            1 => Ok(DrawdownKind::Trailing),
+            value => Err(CodecError::UnknownDiscriminant {
+                kind: "DrawdownKind",
+                value,
+            }),
+        }
+    }
+
+    /// Reads one [`DrawdownRule`] (ABI v3): the [`DrawdownKind`] discriminant then the
+    /// three resolved decimals `limit`, `floor`, `high_water_mark`, in order. Like a
+    /// [`Candle`] it is a nested sub-shape, decoded only inside an [`AccountContext`].
+    fn read_drawdown_rule(&mut self) -> Result<DrawdownRule, CodecError> {
+        Ok(DrawdownRule {
+            kind: self.read_drawdown_kind()?,
+            limit: self.read_decimal()?,
+            floor: self.read_decimal()?,
+            high_water_mark: self.read_decimal()?,
+        })
+    }
 }
 
 // --- Encoder primitives (all little-endian) --------------------------------
@@ -484,6 +616,39 @@ fn put_time_in_force(out: &mut Vec<u8>, value: TimeInForce) {
         TimeInForce::Fok => 2,
         TimeInForce::Gtx => 3,
     });
+}
+
+fn put_account_status(out: &mut Vec<u8>, value: AccountStatus) {
+    out.push(match value {
+        AccountStatus::Evaluation => 0,
+        AccountStatus::Funded => 1,
+    });
+}
+
+fn put_drawdown_kind(out: &mut Vec<u8>, value: DrawdownKind) {
+    out.push(match value {
+        DrawdownKind::Static => 0,
+        DrawdownKind::Trailing => 1,
+    });
+}
+
+fn put_drawdown_rule(out: &mut Vec<u8>, rule: &DrawdownRule) {
+    put_drawdown_kind(out, rule.kind);
+    put_decimal(out, rule.limit);
+    put_decimal(out, rule.floor);
+    put_decimal(out, rule.high_water_mark);
+}
+
+/// Writes an `Option<[u8; 32]>` image hash: a `0`/`1` tag, then the 32 raw bytes when
+/// present. The decode side reads it back via `read_option` and `read_array::<32>()`.
+fn put_image_hash(out: &mut Vec<u8>, value: Option<[u8; 32]>) {
+    match value {
+        None => out.push(0),
+        Some(hash) => {
+            out.push(1);
+            out.extend_from_slice(&hash);
+        }
+    }
 }
 
 /// Runs a top-level decode under the size cap and the full-consumption rule.
@@ -883,6 +1048,271 @@ impl OrderIntentBody {
     }
 }
 
+/// The resolved drawdown rule inside an [`AccountContext`] (ABI v3).
+///
+/// A nested sub-shape, like [`Candle`]: it is never a top-level message and is decoded
+/// only as part of an [`AccountContext`]. The host computes every figure server-side
+/// and ships the resolved snapshot; the guest reads `floor` as the authoritative
+/// current line and never tracks the high-water mark itself. For a [`DrawdownKind::Trailing`]
+/// account the `floor` already reflects the `high_water_mark`; for a
+/// [`DrawdownKind::Static`] account it is the fixed anchor minus the `limit`. On the
+/// wire it is the 1-byte kind discriminant followed by three `Decimal`s (61 bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawdownRule {
+    /// Whether the floor is fixed ([`DrawdownKind::Static`]) or rises with the
+    /// high-water mark ([`DrawdownKind::Trailing`]).
+    pub kind: DrawdownKind,
+    /// The absolute drawdown allowance.
+    pub limit: Decimal,
+    /// The host-computed current effective floor: the equity level that, if touched,
+    /// breaches the drawdown rule. This is the line the bot should act on.
+    pub floor: Decimal,
+    /// The host-computed high-water mark, for the bot's own display or logic. The
+    /// `floor` already bakes it in.
+    pub high_water_mark: Decimal,
+}
+
+/// The read-only account context handed to a v3 guest each tick.
+///
+/// Beyond the figures in [`AccountView`], the guest reads the effective account
+/// lifecycle status and the resolved rule set (daily-loss floor, drawdown kind and
+/// floor, leverage caps, allowed instruments) so a well-behaved bot can shape its own
+/// behaviour within those constraints. The in-bot rules are for *adaptation, not
+/// trust*: host-side `propify-risk` remains the sole backstop and enforces every limit
+/// regardless of what the bot does. The context is produced host-side and is
+/// deterministic per tick, so live behaviour reproduces the backtest.
+///
+/// # Examples
+///
+/// ```
+/// use propify_sandbox_abi::{AccountContext, AccountStatus, DrawdownKind, DrawdownRule};
+/// use rust_decimal::Decimal;
+///
+/// let context = AccountContext {
+///     status: AccountStatus::Evaluation,
+///     daily_loss_limit: Decimal::new(2_000, 0),
+///     daily_loss_floor: Decimal::new(98_000, 0),
+///     drawdown: DrawdownRule {
+///         kind: DrawdownKind::Trailing,
+///         limit: Decimal::new(4_000, 0),
+///         floor: Decimal::new(96_000, 0),
+///         high_water_mark: Decimal::new(100_000, 0),
+///     },
+///     default_leverage: Decimal::new(2, 0),
+///     leverage_overrides: vec![("BTC".to_string(), Decimal::new(5, 0))],
+///     allowed_instruments: vec!["BTC".to_string(), "ETH".to_string()],
+/// };
+/// let bytes = context.encode();
+/// assert_eq!(AccountContext::decode(&bytes), Ok(context));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountContext {
+    /// The account lifecycle status (the first axis of the v3 account model).
+    pub status: AccountStatus,
+    /// The fixed daily loss limit, absolute, in account currency.
+    pub daily_loss_limit: Decimal,
+    /// The host-computed equity level that, if touched, breaches today (day-start
+    /// equity minus the limit). The bot reads this floor directly.
+    pub daily_loss_floor: Decimal,
+    /// The resolved drawdown rule (kind, limit, current floor, high-water mark).
+    pub drawdown: DrawdownRule,
+    /// The default maximum leverage.
+    pub default_leverage: Decimal,
+    /// Per-asset-class leverage caps overriding the default (for example BTC 5x). A
+    /// count-prefixed list of `(asset_class, cap)` pairs, mirroring Propr's
+    /// effective-leverage shape. Bounded by `MAX_LEVERAGE_OVERRIDE_COUNT`.
+    pub leverage_overrides: Vec<(String, Decimal)>,
+    /// The permitted asset symbols (the Hyperliquid perpetual futures). A
+    /// count-prefixed list bounded by `MAX_ALLOWED_INSTRUMENT_COUNT`.
+    pub allowed_instruments: Vec<String>,
+}
+
+impl AccountContext {
+    /// Encodes the account context into the v3 wire bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_account_status(&mut out, self.status);
+        put_decimal(&mut out, self.daily_loss_limit);
+        put_decimal(&mut out, self.daily_loss_floor);
+        put_drawdown_rule(&mut out, &self.drawdown);
+        put_decimal(&mut out, self.default_leverage);
+        // Both lists fit in `u32` for any realistic context; each count is capped on
+        // decode.
+        put_u32(&mut out, self.leverage_overrides.len() as u32);
+        for (asset_class, cap) in &self.leverage_overrides {
+            put_string(&mut out, asset_class);
+            put_decimal(&mut out, *cap);
+        }
+        put_u32(&mut out, self.allowed_instruments.len() as u32);
+        for instrument in &self.allowed_instruments {
+            put_string(&mut out, instrument);
+        }
+        out
+    }
+
+    /// Decodes the account context from v3 wire bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CodecError`] for an unknown [`AccountStatus`] or [`DrawdownKind`]
+    /// discriminant, an over-cap list count ([`CodecError::Oversized`]), an
+    /// over-cap asset-class string, an out-of-range decimal, a short or oversized
+    /// buffer, or any trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        decode_message(bytes, |cursor| {
+            let status = cursor.read_account_status()?;
+            let daily_loss_limit = cursor.read_decimal()?;
+            let daily_loss_floor = cursor.read_decimal()?;
+            let drawdown = cursor.read_drawdown_rule()?;
+            let default_leverage = cursor.read_decimal()?;
+
+            let override_count = cursor.read_u32()? as usize;
+            if override_count > MAX_LEVERAGE_OVERRIDE_COUNT {
+                return Err(CodecError::Oversized {
+                    size: override_count,
+                    limit: MAX_LEVERAGE_OVERRIDE_COUNT,
+                });
+            }
+            // Not pre-sized from the untrusted `count`: a short buffer fails fast on the
+            // first missing pair instead of letting a huge `count` drive an allocation.
+            let mut leverage_overrides = Vec::new();
+            for _ in 0..override_count {
+                let asset_class = cursor.read_string_capped(MAX_ASSET_CLASS_BYTES)?;
+                let cap = cursor.read_decimal()?;
+                leverage_overrides.push((asset_class, cap));
+            }
+
+            let instrument_count = cursor.read_u32()? as usize;
+            if instrument_count > MAX_ALLOWED_INSTRUMENT_COUNT {
+                return Err(CodecError::Oversized {
+                    size: instrument_count,
+                    limit: MAX_ALLOWED_INSTRUMENT_COUNT,
+                });
+            }
+            let mut allowed_instruments = Vec::new();
+            for _ in 0..instrument_count {
+                allowed_instruments.push(cursor.read_string()?);
+            }
+
+            Ok(Self {
+                status,
+                daily_loss_limit,
+                daily_loss_floor,
+                drawdown,
+                default_leverage,
+                leverage_overrides,
+                allowed_instruments,
+            })
+        })
+    }
+}
+
+/// The bot's self-declared identity and metadata, embedded in the artifact (ABI v3).
+///
+/// The SDK encodes this at build time into a `propify_manifest` wasm custom section, so
+/// it is hashed together with the code by `ArtifactId = sha256(module bytes)` and
+/// cannot be changed without changing the content address. The host extracts and
+/// decodes it during the static scan, before instantiating any guest code.
+///
+/// This codec is deliberately **dumb**: it does a structural decode and enforces a
+/// per-field byte cap on each string, and nothing more. The semantic validators —
+/// strict semver on `version`, SPDX on `license`, EIP-55 checksum on `author_erc20`,
+/// https-URL on `source_repo_url`, syntactic email on `author_email` — and the image
+/// checks live marketplace-side, not here. The author fields are self-declared and are
+/// not the authenticated submitter.
+///
+/// # Examples
+///
+/// ```
+/// use propify_sandbox_abi::BotManifest;
+///
+/// let manifest = BotManifest {
+///     name: "DCA Bot".to_string(),
+///     description: "Dollar-cost averaging strategy.".to_string(),
+///     version: "1.0.0".to_string(),
+///     license: "Apache-2.0".to_string(),
+///     image_sha256: None,
+///     author_name: "Jane Doe".to_string(),
+///     author_email: "jane@example.com".to_string(),
+///     author_erc20: "0x52908400098527886E0F7030069857D2E4169EE7".to_string(),
+///     source_repo_url: "https://example.com/jane/dca-bot".to_string(),
+/// };
+/// let bytes = manifest.encode();
+/// assert_eq!(BotManifest::decode(&bytes), Ok(manifest));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotManifest {
+    /// Human-readable bot name. Capped at 100 bytes on decode.
+    pub name: String,
+    /// Short description of the bot. Capped at 2000 bytes on decode.
+    pub description: String,
+    /// The bot version. Semver is validated marketplace-side; capped at 64 bytes here.
+    pub version: String,
+    /// A single SPDX license identifier. Validated marketplace-side; capped at 64 bytes.
+    pub license: String,
+    /// Content hash of a separately uploaded image, or `None` when the bot ships none.
+    pub image_sha256: Option<[u8; 32]>,
+    /// Self-declared author name. Capped at 100 bytes on decode.
+    pub author_name: String,
+    /// Self-declared author email. Validated syntactically marketplace-side; capped at
+    /// 254 bytes here. Not verified.
+    pub author_email: String,
+    /// Self-declared author ERC20 address. EIP-55 checksum is validated
+    /// marketplace-side; capped at 42 bytes here.
+    pub author_erc20: String,
+    /// Link to the bot source repository. https-only is validated marketplace-side;
+    /// capped at 512 bytes here.
+    pub source_repo_url: String,
+}
+
+impl BotManifest {
+    /// Encodes the manifest into the v3 wire bytes for the `propify_manifest` section.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_string(&mut out, &self.name);
+        put_string(&mut out, &self.description);
+        put_string(&mut out, &self.version);
+        put_string(&mut out, &self.license);
+        put_image_hash(&mut out, self.image_sha256);
+        put_string(&mut out, &self.author_name);
+        put_string(&mut out, &self.author_email);
+        put_string(&mut out, &self.author_erc20);
+        put_string(&mut out, &self.source_repo_url);
+        out
+    }
+
+    /// Decodes the manifest from the `propify_manifest` section bytes.
+    ///
+    /// This is a structural decode with per-field byte caps only. Each over-cap string
+    /// is rejected as [`CodecError::Oversized`] before its bytes are read. Semantic
+    /// validation is the marketplace's job and does not happen here. The overall
+    /// [`MAX_MANIFEST_BYTES`] cap is enforced by the scanner before this is called; the
+    /// codec's own backstop is the [`MAX_MESSAGE_BYTES`] cap inside [`decode_message`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CodecError`] for an over-cap field ([`CodecError::Oversized`]),
+    /// invalid UTF-8 in any string, a bad image-hash tag byte, a short or oversized
+    /// buffer, or any trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        decode_message(bytes, |cursor| {
+            Ok(Self {
+                name: cursor.read_string_capped(MAX_MANIFEST_NAME_BYTES)?,
+                description: cursor.read_string_capped(MAX_MANIFEST_DESCRIPTION_BYTES)?,
+                version: cursor.read_string_capped(MAX_MANIFEST_VERSION_BYTES)?,
+                license: cursor.read_string_capped(MAX_MANIFEST_LICENSE_BYTES)?,
+                image_sha256: cursor.read_option(|inner| inner.read_array::<32>())?,
+                author_name: cursor.read_string_capped(MAX_MANIFEST_AUTHOR_NAME_BYTES)?,
+                author_email: cursor.read_string_capped(MAX_MANIFEST_AUTHOR_EMAIL_BYTES)?,
+                author_erc20: cursor.read_string_capped(MAX_MANIFEST_AUTHOR_ERC20_BYTES)?,
+                source_repo_url: cursor.read_string_capped(MAX_MANIFEST_SOURCE_REPO_URL_BYTES)?,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,5 +1689,274 @@ mod tests {
     #[test]
     fn valid_body_passes_validate() {
         assert_eq!(sample_body().validate(), Ok(()));
+    }
+
+    // --- ABI v3: AccountContext ----------------------------------------------
+
+    /// A representative drawdown rule for account-context tests.
+    fn sample_drawdown() -> DrawdownRule {
+        DrawdownRule {
+            kind: DrawdownKind::Trailing,
+            limit: dec!(4000),
+            floor: dec!(96000.50),
+            high_water_mark: dec!(100000),
+        }
+    }
+
+    /// A representative, fully-populated account context for round-trip tests.
+    fn sample_context() -> AccountContext {
+        AccountContext {
+            status: AccountStatus::Funded,
+            daily_loss_limit: dec!(2000),
+            daily_loss_floor: dec!(98000.25),
+            drawdown: sample_drawdown(),
+            default_leverage: dec!(2),
+            leverage_overrides: vec![
+                ("BTC".to_string(), dec!(5)),
+                ("ETH".to_string(), dec!(5)),
+                ("crypto".to_string(), dec!(2)),
+            ],
+            allowed_instruments: vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string()],
+        }
+    }
+
+    #[test]
+    fn account_context_round_trips_with_overrides_and_instruments() {
+        let context = sample_context();
+        assert_eq!(AccountContext::decode(&context.encode()), Ok(context));
+    }
+
+    #[test]
+    fn account_context_round_trips_with_empty_lists() {
+        // No leverage overrides and no allowed instruments still round-trips: both
+        // count prefixes are zero.
+        let context = AccountContext {
+            leverage_overrides: Vec::new(),
+            allowed_instruments: Vec::new(),
+            ..sample_context()
+        };
+        assert_eq!(AccountContext::decode(&context.encode()), Ok(context));
+    }
+
+    #[test]
+    fn account_context_at_full_caps_round_trips() {
+        // Exactly MAX_LEVERAGE_OVERRIDE_COUNT overrides and
+        // MAX_ALLOWED_INSTRUMENT_COUNT instruments is the largest accepted context.
+        let leverage_overrides = (0..MAX_LEVERAGE_OVERRIDE_COUNT)
+            .map(|i| (format!("class{i}"), dec!(3)))
+            .collect();
+        let allowed_instruments = (0..MAX_ALLOWED_INSTRUMENT_COUNT)
+            .map(|i| format!("INST{i}"))
+            .collect();
+        let context = AccountContext {
+            leverage_overrides,
+            allowed_instruments,
+            ..sample_context()
+        };
+        assert_eq!(AccountContext::decode(&context.encode()), Ok(context));
+    }
+
+    #[test]
+    fn account_context_over_cap_override_count_is_rejected_as_oversized() {
+        // Hand-built bytes claiming one more override than the cap. The count is
+        // refused before any pair is read, so no pair bytes are needed.
+        let over = MAX_LEVERAGE_OVERRIDE_COUNT + 1;
+        let mut bytes = Vec::new();
+        put_account_status(&mut bytes, AccountStatus::Evaluation);
+        put_decimal(&mut bytes, dec!(0));
+        put_decimal(&mut bytes, dec!(0));
+        put_drawdown_rule(&mut bytes, &sample_drawdown());
+        put_decimal(&mut bytes, dec!(0));
+        put_u32(&mut bytes, over as u32);
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::Oversized {
+                size: over,
+                limit: MAX_LEVERAGE_OVERRIDE_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn account_context_over_cap_instrument_count_is_rejected_as_oversized() {
+        // A valid (empty) override list, then an over-cap instrument count.
+        let over = MAX_ALLOWED_INSTRUMENT_COUNT + 1;
+        let mut bytes = Vec::new();
+        put_account_status(&mut bytes, AccountStatus::Evaluation);
+        put_decimal(&mut bytes, dec!(0));
+        put_decimal(&mut bytes, dec!(0));
+        put_drawdown_rule(&mut bytes, &sample_drawdown());
+        put_decimal(&mut bytes, dec!(0));
+        put_u32(&mut bytes, 0);
+        put_u32(&mut bytes, over as u32);
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::Oversized {
+                size: over,
+                limit: MAX_ALLOWED_INSTRUMENT_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn account_context_unknown_status_discriminant_is_rejected() {
+        let mut bytes = sample_context().encode();
+        // The first byte is the AccountStatus discriminant; 9 is not a known variant.
+        bytes[0] = 9;
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::UnknownDiscriminant {
+                kind: "AccountStatus",
+                value: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn account_context_unknown_drawdown_kind_discriminant_is_rejected() {
+        let mut bytes = sample_context().encode();
+        // Layout: status (1) + daily_loss_limit (20) + daily_loss_floor (20) puts the
+        // DrawdownKind discriminant at byte 41.
+        bytes[41] = 9;
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::UnknownDiscriminant {
+                kind: "DrawdownKind",
+                value: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn account_context_trailing_bytes_are_rejected() {
+        let mut bytes = sample_context().encode();
+        bytes.push(0xff);
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn account_context_short_buffer_is_rejected() {
+        let bytes = sample_context().encode();
+        // Drop the final bytes so the last instrument string runs off the end.
+        let truncated = &bytes[..bytes.len() - 3];
+        assert_eq!(
+            AccountContext::decode(truncated),
+            Err(CodecError::ShortBuffer)
+        );
+    }
+
+    // --- ABI v3: BotManifest -------------------------------------------------
+
+    /// A representative, valid manifest (every field within its cap) for tests.
+    fn baseline_manifest() -> BotManifest {
+        BotManifest {
+            name: "DCA Bot".to_string(),
+            description: "Dollar-cost averaging strategy.".to_string(),
+            version: "1.0.0".to_string(),
+            license: "Apache-2.0".to_string(),
+            image_sha256: None,
+            author_name: "Jane Doe".to_string(),
+            author_email: "jane@example.com".to_string(),
+            author_erc20: "0x52908400098527886E0F7030069857D2E4169EE7".to_string(),
+            source_repo_url: "https://example.com/jane/dca-bot".to_string(),
+        }
+    }
+
+    /// A manifest field's name, its byte cap, and a setter for the boundary tests.
+    type ManifestFieldCap = (&'static str, usize, fn(&mut BotManifest, String));
+
+    /// The per-field byte caps as `(field name, cap, setter)` for boundary tests.
+    fn manifest_field_caps() -> Vec<ManifestFieldCap> {
+        vec![
+            ("name", MAX_MANIFEST_NAME_BYTES, |m, s| m.name = s),
+            ("description", MAX_MANIFEST_DESCRIPTION_BYTES, |m, s| {
+                m.description = s
+            }),
+            ("version", MAX_MANIFEST_VERSION_BYTES, |m, s| m.version = s),
+            ("license", MAX_MANIFEST_LICENSE_BYTES, |m, s| m.license = s),
+            ("author_name", MAX_MANIFEST_AUTHOR_NAME_BYTES, |m, s| {
+                m.author_name = s
+            }),
+            ("author_email", MAX_MANIFEST_AUTHOR_EMAIL_BYTES, |m, s| {
+                m.author_email = s
+            }),
+            ("author_erc20", MAX_MANIFEST_AUTHOR_ERC20_BYTES, |m, s| {
+                m.author_erc20 = s
+            }),
+            (
+                "source_repo_url",
+                MAX_MANIFEST_SOURCE_REPO_URL_BYTES,
+                |m, s| m.source_repo_url = s,
+            ),
+        ]
+    }
+
+    #[test]
+    fn bot_manifest_round_trips_with_image() {
+        let manifest = BotManifest {
+            image_sha256: Some([7u8; 32]),
+            ..baseline_manifest()
+        };
+        assert_eq!(BotManifest::decode(&manifest.encode()), Ok(manifest));
+    }
+
+    #[test]
+    fn bot_manifest_round_trips_without_image() {
+        let manifest = baseline_manifest();
+        assert_eq!(BotManifest::decode(&manifest.encode()), Ok(manifest));
+    }
+
+    #[test]
+    fn bot_manifest_per_field_byte_caps() {
+        for (field, cap, set) in manifest_field_caps() {
+            // A field at exactly its byte cap decodes cleanly and round-trips.
+            let mut at_cap = baseline_manifest();
+            set(&mut at_cap, "a".repeat(cap));
+            assert_eq!(
+                BotManifest::decode(&at_cap.encode()),
+                Ok(at_cap),
+                "{field} at its {cap}-byte cap must round-trip"
+            );
+
+            // One byte over the cap is refused as Oversized before the bytes are read.
+            let mut over_cap = baseline_manifest();
+            set(&mut over_cap, "a".repeat(cap + 1));
+            assert_eq!(
+                BotManifest::decode(&over_cap.encode()),
+                Err(CodecError::Oversized {
+                    size: cap + 1,
+                    limit: cap,
+                }),
+                "{field} one byte over its cap must be rejected as Oversized"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_manifest_trailing_bytes_are_rejected() {
+        let mut bytes = baseline_manifest().encode();
+        bytes.push(0xff);
+        assert_eq!(BotManifest::decode(&bytes), Err(CodecError::TrailingBytes));
+    }
+
+    #[test]
+    fn bot_manifest_short_buffer_is_rejected() {
+        let bytes = baseline_manifest().encode();
+        // Drop the final bytes so the last field runs off the end.
+        let truncated = &bytes[..bytes.len() - 3];
+        assert_eq!(BotManifest::decode(truncated), Err(CodecError::ShortBuffer));
+    }
+
+    #[test]
+    fn bot_manifest_bad_utf8_in_a_field_is_rejected() {
+        // A name field with a one-byte, invalid-UTF-8 value. The decoder reaches name
+        // first and rejects it before any later field is read.
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 1);
+        bytes.push(0xff); // not valid UTF-8
+        assert_eq!(BotManifest::decode(&bytes), Err(CodecError::BadUtf8));
     }
 }

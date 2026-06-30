@@ -1,4 +1,4 @@
-//! The six closed enumerations carried on the sandbox boundary.
+//! The eight closed enumerations carried on the sandbox boundary.
 //!
 //! These mirror the Propr API "Enums" section (see `docs/specs/propr-api.md`).
 //! Modeling them as Rust enums rather than free strings makes invalid states
@@ -84,6 +84,41 @@ pub enum TimeInForce {
     Fok,
     /// Post-only / maker (`GTX` on the wire).
     Gtx,
+}
+
+/// Account lifecycle status, the first axis of the ABI v3 account model.
+///
+/// Resolved host-side from `ChallengeAttempt.status` (`active` = [`AccountStatus::Evaluation`],
+/// `passed` = [`AccountStatus::Funded`]) and shipped to the guest inside the
+/// `AccountContext` so a bot can shape its behaviour for the phase it is in (for
+/// example, stop opening risk in evaluation near the profit target). The discriminant
+/// meanings are frozen and must not be renumbered; the codec encodes them by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum AccountStatus {
+    /// The account is in an evaluation phase (Propr `active`).
+    Evaluation,
+    /// The account is funded (Propr `passed`).
+    Funded,
+}
+
+/// How the maximum drawdown floor is computed, the second axis of the v3 rule set.
+///
+/// The distinction comes from the challenge phase count, not from string-parsing the
+/// challenge name: 1-step tiers are [`DrawdownKind::Static`], the 2-step tier is
+/// [`DrawdownKind::Trailing`] (high-water-mark based). It travels inside the
+/// `DrawdownRule` so the guest can read whether its floor moves with equity. The
+/// discriminant meanings are frozen and must not be renumbered; the codec encodes them
+/// by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum DrawdownKind {
+    /// A fixed floor at the anchor minus the limit.
+    Static,
+    /// A floor that rises with the high-water mark.
+    Trailing,
 }
 
 // The serde wire-spelling tests for these six enums live in `propify-core`'s
