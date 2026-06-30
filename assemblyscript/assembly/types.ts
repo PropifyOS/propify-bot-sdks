@@ -308,7 +308,13 @@ export class AccountContext {
     public drawdown: DrawdownRule,
     public defaultLeverage: Decimal,
     public leverageOverrides: Array<LeverageOverride>,
-    public allowedInstruments: Array<ByteSlice>
+    public allowedInstruments: Array<ByteSlice>,
+    /**
+     * The absolute equity level at which the evaluation challenge passes, or `null` on
+     * a funded account (which has no profit target). Mirrors the Rust
+     * `Option<Decimal>`: a `Some` value while Evaluation, `null` when Funded.
+     */
+    public profitTarget: Decimal | null
   ) {}
 
   /**
@@ -358,6 +364,19 @@ export class AccountContext {
       allowedInstruments[<i32>i] = instrument;
     }
 
+    // The `Option<Decimal>` profit-target tail: tag 0 = None (`null`, Funded), tag 1 =
+    // Some + the decimal (Evaluation). Any other tag is malformed, exactly as the Rust
+    // codec rejects an out-of-range Option tag.
+    const profitTargetTag = reader.readU8();
+    if (reader.failed) return null;
+    let profitTarget: Decimal | null = null;
+    if (profitTargetTag == 1) {
+      profitTarget = reader.readDecimal();
+      if (reader.failed) return null;
+    } else if (profitTargetTag != 0) {
+      return null;
+    }
+
     const drawdown = new DrawdownRule(
       drawdownKind,
       drawdownLimit,
@@ -371,7 +390,8 @@ export class AccountContext {
       drawdown,
       defaultLeverage,
       leverageOverrides,
-      allowedInstruments
+      allowedInstruments,
+      profitTarget
     );
   }
 }

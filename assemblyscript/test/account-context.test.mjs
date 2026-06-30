@@ -60,7 +60,8 @@ const decBytes = (d) => [...i64le(d.lo), ...i64le(d.hi), ...i32le(d.scale)];
 // daily_loss_limit + daily_loss_floor (Decimal), the inline DrawdownRule (kind u8 +
 // limit/floor/high_water_mark Decimals), default_leverage (Decimal), a u32-count-prefixed
 // list of (asset_class String, cap Decimal) overrides, then a u32-count-prefixed list of
-// allowed-instrument Strings.
+// allowed-instrument Strings, then an Option<Decimal> profit_target tail (tag 0 = None,
+// tag 1 = Some + the decimal).
 const contextBytes = (c) => {
   const out = [
     c.status,
@@ -76,6 +77,11 @@ const contextBytes = (c) => {
   for (const o of c.overrides) out.push(...strBytes(o.assetClass), ...decBytes(o.cap));
   out.push(...u32le(c.instruments.length));
   for (const s of c.instruments) out.push(...strBytes(s));
+  if (c.profitTarget == null) {
+    out.push(0);
+  } else {
+    out.push(1, ...decBytes(c.profitTarget));
+  }
   return out;
 };
 
@@ -114,6 +120,10 @@ const FULL_CONTEXT = {
     { assetClass: "OTHER_CRYPTO", cap: d(2, 0, 0) },
   ],
   instruments: ["BTC", "ETH", "SOL", "DOGE"],
+  // A `Some` profit target exercises the Option<Decimal> tail's Some arm. The codec is
+  // agnostic to the status/target coupling (a producer concern), so a present target on
+  // any status is a valid decode; 105000.00.
+  profitTarget: d(10500000, 0, 2),
 };
 
 // --- shim harness -------------------------------------------------------------
@@ -179,6 +189,12 @@ test("decodes a full context and round-trips every scalar field and the drawdown
   for (let field = 0; field < DECIMALS.length; field++) {
     assertDecimal(field, DECIMALS[field], LABELS[field]);
   }
+
+  // The Option<Decimal> profit-target tail's Some arm round-trips to the exact decimal.
+  assert.equal(instance.exports.profitTargetPresent(), 1, "the Some profit target is present");
+  assert.equal(instance.exports.profitTargetLow(), FULL_CONTEXT.profitTarget.lo, "profitTarget.low");
+  assert.equal(instance.exports.profitTargetHigh(), FULL_CONTEXT.profitTarget.hi, "profitTarget.high");
+  assert.equal(instance.exports.profitTargetScale(), FULL_CONTEXT.profitTarget.scale, "profitTarget.scale");
 });
 
 test("decodes the leverage-overrides list: each asset class and cap round-trips", () => {
@@ -215,12 +231,14 @@ test("a context with both lists empty decodes successfully with zero-length list
     defaultLeverage: d(2, 0, 0),
     overrides: [],
     instruments: [],
+    profitTarget: null, // Funded-style: no profit target (None arm of the tail).
   };
   assert.equal(decodeContext(contextBytes(empty)), 1, "empty lists are valid, not a decode failure");
   assert.equal(instance.exports.status(), 0, "status still decodes on empty lists");
   assert.equal(instance.exports.drawdownKind(), 0, "drawdown kind still decodes on empty lists");
   assert.equal(instance.exports.overrideCount(), 0, "no overrides");
   assert.equal(instance.exports.instrumentCount(), 0, "no instruments");
+  assert.equal(instance.exports.profitTargetPresent(), 0, "a None profit target decodes to null");
 });
 
 test("a full-capacity context (64 overrides, 1024 instruments) decodes every element", () => {

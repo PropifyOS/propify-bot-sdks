@@ -61,7 +61,8 @@ const accountBytes = (four) => four.flatMap((d) => decBytes(d[0], d[1], d[2]));
 // (u8), daily_loss_limit + daily_loss_floor (Decimal), the inline DrawdownRule (kind u8 +
 // limit/floor/high_water_mark Decimals), default_leverage (Decimal), a u32-count-prefixed
 // list of (asset_class String, cap Decimal) overrides, and a u32-count-prefixed list of
-// allowed-instrument Strings.
+// allowed-instrument Strings, then an Option<Decimal> profit_target tail (tag 0 = None,
+// tag 1 = Some + the decimal).
 const contextBytes = (c) => {
   const out = [
     c.status,
@@ -77,6 +78,11 @@ const contextBytes = (c) => {
   for (const o of c.overrides) out.push(...strBytes(o.assetClass), ...decBytes(...o.cap));
   out.push(...u32le(c.instruments.length));
   for (const s of c.instruments) out.push(...strBytes(s));
+  if (c.profitTarget == null) {
+    out.push(0);
+  } else {
+    out.push(1, ...decBytes(...c.profitTarget));
+  }
   return out;
 };
 
@@ -149,6 +155,7 @@ const SAMPLE_CONTEXT = contextBytes({
   defaultLeverage: [2n, 0n, 0], // 2x
   overrides: [],
   instruments: [],
+  profitTarget: [500000n, 0n, 2], // Evaluation: Some 5000.00 absolute equity target
 });
 
 /**

@@ -115,3 +115,23 @@ export function instrumentPtr(i: i32): usize {
 export function instrumentLen(i: i32): i32 {
   return ctx!.allowedInstruments[i].len;
 }
+
+/** `1` when the decoded context carries a profit target (`Some`), `0` when `null`. */
+export function profitTargetPresent(): i32 {
+  return ctx!.profitTarget === null ? 0 : 1;
+}
+
+/** Low 8 bytes of the i128 mantissa of the profit target (caller checks present first). */
+export function profitTargetLow(): i64 {
+  return ctx!.profitTarget!.mantissaLow;
+}
+
+/** High 8 bytes of the i128 mantissa of the profit target. */
+export function profitTargetHigh(): i64 {
+  return ctx!.profitTarget!.mantissaHigh;
+}
+
+/** Scale of the profit target. */
+export function profitTargetScale(): i32 {
+  return ctx!.profitTarget!.scale;
+}

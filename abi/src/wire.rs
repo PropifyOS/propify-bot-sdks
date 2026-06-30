@@ -1101,6 +1101,7 @@ pub struct DrawdownRule {
 ///     default_leverage: Decimal::new(2, 0),
 ///     leverage_overrides: vec![("BTC".to_string(), Decimal::new(5, 0))],
 ///     allowed_instruments: vec!["BTC".to_string(), "ETH".to_string()],
+///     profit_target: Some(Decimal::new(105_000, 0)),
 /// };
 /// let bytes = context.encode();
 /// assert_eq!(AccountContext::decode(&bytes), Ok(context));
@@ -1125,6 +1126,12 @@ pub struct AccountContext {
     /// The permitted asset symbols (the Hyperliquid perpetual futures). A
     /// count-prefixed list bounded by `MAX_ALLOWED_INSTRUMENT_COUNT`.
     pub allowed_instruments: Vec<String>,
+    /// The absolute equity level at which the evaluation challenge passes, or `None`
+    /// on a funded account (which has no profit target). The host computes this from
+    /// the per-tier per-phase profit-target percent applied to the starting-balance
+    /// basis, mirroring how the floors are absolute equity levels. A well-behaved bot
+    /// can stop opening risk in evaluation as equity nears this line.
+    pub profit_target: Option<Decimal>,
 }
 
 impl AccountContext {
@@ -1148,6 +1155,8 @@ impl AccountContext {
         for instrument in &self.allowed_instruments {
             put_string(&mut out, instrument);
         }
+        // `Some` while Evaluation (the absolute equity pass level), `None` when Funded.
+        put_option_decimal(&mut out, self.profit_target);
         out
     }
 
@@ -1195,6 +1204,8 @@ impl AccountContext {
                 allowed_instruments.push(cursor.read_string()?);
             }
 
+            let profit_target = cursor.read_option(Cursor::read_decimal)?;
+
             Ok(Self {
                 status,
                 daily_loss_limit,
@@ -1203,6 +1214,7 @@ impl AccountContext {
                 default_leverage,
                 leverage_overrides,
                 allowed_instruments,
+                profit_target,
             })
         })
     }
@@ -1717,12 +1729,26 @@ mod tests {
                 ("crypto".to_string(), dec!(2)),
             ],
             allowed_instruments: vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string()],
+            // The sample is Funded, so it carries no profit target.
+            profit_target: None,
         }
     }
 
     #[test]
     fn account_context_round_trips_with_overrides_and_instruments() {
         let context = sample_context();
+        assert_eq!(AccountContext::decode(&context.encode()), Ok(context));
+    }
+
+    #[test]
+    fn account_context_round_trips_with_evaluation_profit_target() {
+        // An Evaluation account carries `Some` absolute equity profit target; the
+        // `Option<Decimal>` tail of the layout must round-trip the `Some` arm.
+        let context = AccountContext {
+            status: AccountStatus::Evaluation,
+            profit_target: Some(dec!(105000.75)),
+            ..sample_context()
+        };
         assert_eq!(AccountContext::decode(&context.encode()), Ok(context));
     }
 

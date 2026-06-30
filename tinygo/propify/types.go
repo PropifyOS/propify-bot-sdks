@@ -321,6 +321,11 @@ type AccountContext struct {
 	DefaultLeverage    Decimal
 	LeverageOverrides  []LeverageOverride
 	AllowedInstruments [][]byte
+	// ProfitTarget is the absolute equity level at which the evaluation challenge
+	// passes, or nil on a funded account (which has no profit target). It mirrors the
+	// Rust Option<Decimal>: a Some value while Evaluation, nil when Funded. When set, it
+	// aliases the static profitTargetStorage so the decode never touches the Go heap.
+	ProfitTarget *Decimal
 }
 
 // tickContext, leverageOverrideStorage and allowedInstrumentStorage are the static decode
@@ -334,6 +339,9 @@ var (
 	tickContext              AccountContext
 	leverageOverrideStorage  [maxLeverageOverrideCount]LeverageOverride
 	allowedInstrumentStorage [maxAllowedInstrumentCount][]byte
+	// profitTargetStorage holds this tick's Some profit-target decimal so the context's
+	// ProfitTarget pointer aliases the data segment instead of escaping to the Go heap.
+	profitTargetStorage Decimal
 )
 
 // decodeAccountContext decodes an account context from v3 wire bytes, mirroring the host
@@ -392,6 +400,28 @@ func decodeAccountContext(buf []byte) (*AccountContext, bool) {
 		allowedInstrumentStorage[i] = instrument
 	}
 
+	// The Option<Decimal> profit-target tail: tag 0 = None (nil, Funded), tag 1 = Some +
+	// the decimal (Evaluation). Any other tag is malformed, exactly as the Rust codec
+	// rejects an out-of-range Option tag. A Some value is read into the static storage so
+	// the pointer aliases the data segment rather than escaping to the heap.
+	profitTargetTag := r.readU8()
+	if r.failed {
+		return nil, false
+	}
+	var profitTarget *Decimal
+	switch profitTargetTag {
+	case 0:
+		profitTarget = nil
+	case 1:
+		profitTargetStorage = r.readDecimal()
+		if r.failed {
+			return nil, false
+		}
+		profitTarget = &profitTargetStorage
+	default:
+		return nil, false
+	}
+
 	tickContext = AccountContext{
 		Status:             status,
 		DailyLossLimit:     dailyLossLimit,
@@ -400,6 +430,7 @@ func decodeAccountContext(buf []byte) (*AccountContext, bool) {
 		DefaultLeverage:    defaultLeverage,
 		LeverageOverrides:  leverageOverrideStorage[:overrideCount],
 		AllowedInstruments: allowedInstrumentStorage[:instrumentCount],
+		ProfitTarget:       profitTarget,
 	}
 	return &tickContext, true
 }

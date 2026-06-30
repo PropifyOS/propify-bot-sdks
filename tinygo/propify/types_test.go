@@ -322,6 +322,7 @@ func TestStrategyParamsFindReturnsIndependentValues(t *testing.T) {
 //	                 + DrawdownRule + default_leverage Decimal
 //	                 + u32 override count + count*(asset_class String, cap Decimal)
 //	                 + u32 instrument count + count*String
+//	                 + Option<Decimal> profit_target (tag u8, then Decimal when Some)
 //	DrawdownRule   = kind u8 + limit Decimal + floor Decimal + high_water_mark Decimal
 
 func putU8(b *[]byte, v uint8) {
@@ -343,6 +344,7 @@ func buildAccountContext(
 	defaultLeverage dec,
 	overrides []leverageOverrideFixture,
 	instruments []string,
+	profitTarget *dec,
 ) []byte {
 	var b []byte
 	putU8(&b, status)
@@ -361,6 +363,13 @@ func buildAccountContext(
 	putU32(&b, uint32(len(instruments)))
 	for _, s := range instruments {
 		putString(&b, s)
+	}
+	// Option<Decimal> profit-target tail: tag 0 = None, tag 1 = Some + the decimal.
+	if profitTarget == nil {
+		putU8(&b, 0)
+	} else {
+		putU8(&b, 1)
+		putDecimal(&b, *profitTarget)
 	}
 	return b
 }
@@ -388,6 +397,7 @@ func TestDecodeAccountContextPopulated(t *testing.T) {
 		ctxDailyLimit, ctxDailyFloor,
 		DrawdownKindTrailing, ctxDdLimit, ctxDdFloor, ctxDdHWM,
 		ctxDefaultLev, overrides, instruments,
+		nil, // Funded: no profit target (None arm of the tail).
 	)
 
 	ctx, ok := decodeAccountContext(buf)
@@ -396,6 +406,9 @@ func TestDecodeAccountContextPopulated(t *testing.T) {
 	}
 	if ctx.Status != AccountStatusFunded {
 		t.Errorf("status got %d, want %d", ctx.Status, AccountStatusFunded)
+	}
+	if ctx.ProfitTarget != nil {
+		t.Errorf("a Funded context must decode a nil profit target, got %+v", *ctx.ProfitTarget)
 	}
 	assertDecimal(t, "daily_loss_limit", ctx.DailyLossLimit, ctxDailyLimit)
 	assertDecimal(t, "daily_loss_floor", ctx.DailyLossFloor, ctxDailyFloor)
@@ -437,12 +450,15 @@ func TestDecodeAccountContextPopulated(t *testing.T) {
 
 func TestDecodeAccountContextEmptyLists(t *testing.T) {
 	// No overrides and no allowed instruments: both count prefixes are zero. It must
-	// decode successfully with empty slices — a valid context, not a failure.
+	// decode successfully with empty slices — a valid context, not a failure. An
+	// Evaluation account carries a Some profit target, exercising the tail's Some arm.
+	ctxProfitTarget := dec{low: 10_500_000, high: 0, scale: 2} // 105000.00 absolute equity
 	buf := buildAccountContext(
 		AccountStatusEvaluation,
 		ctxDailyLimit, ctxDailyFloor,
 		DrawdownKindStatic, ctxDdLimit, ctxDdFloor, ctxDdHWM,
 		ctxDefaultLev, nil, nil,
+		&ctxProfitTarget,
 	)
 	ctx, ok := decodeAccountContext(buf)
 	if !ok {
@@ -451,6 +467,10 @@ func TestDecodeAccountContextEmptyLists(t *testing.T) {
 	if ctx.Status != AccountStatusEvaluation {
 		t.Errorf("status got %d, want %d", ctx.Status, AccountStatusEvaluation)
 	}
+	if ctx.ProfitTarget == nil {
+		t.Fatalf("an Evaluation context must decode a Some profit target, got nil")
+	}
+	assertDecimal(t, "profit_target", *ctx.ProfitTarget, ctxProfitTarget)
 	if ctx.Drawdown.Kind != DrawdownKindStatic {
 		t.Errorf("drawdown.kind got %d, want %d", ctx.Drawdown.Kind, DrawdownKindStatic)
 	}

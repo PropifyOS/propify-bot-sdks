@@ -459,6 +459,8 @@ mod tests {
             default_leverage: dec!(2),
             leverage_overrides: vec![("BTC".to_string(), dec!(5)), ("ETH".to_string(), dec!(5))],
             allowed_instruments: vec!["BTC".to_string(), "ETH".to_string()],
+            // Funded accounts carry no profit target.
+            profit_target: None,
         }
     }
 
