@@ -51,6 +51,20 @@ const (
 	TimeInForceGtx uint8 = 3
 )
 
+// AccountStatus discriminants (FROZEN, ABI v3). The account lifecycle status, resolved
+// host-side from the challenge attempt and carried in the AccountContext.
+const (
+	AccountStatusEvaluation uint8 = 0
+	AccountStatusFunded     uint8 = 1
+)
+
+// DrawdownKind discriminants (FROZEN, ABI v3). Whether the drawdown floor is fixed
+// (Static) or rises with the high-water mark (Trailing).
+const (
+	DrawdownKindStatic   uint8 = 0
+	DrawdownKindTrailing uint8 = 1
+)
+
 // MarketSnapshot is a single market observation handed to the bot each tick.
 //
 // Asset is a sub-slice aliasing the host-written input buffer rather than a copied
@@ -256,6 +270,138 @@ func decodeAccountView(buf []byte) (*AccountView, bool) {
 		UnrealizedPnl:   unrealizedPnl,
 	}
 	return &tickAccount, true
+}
+
+// maxLeverageOverrideCount and maxAllowedInstrumentCount cap the two count-prefixed lists
+// in an AccountContext, matching the host's MAX_LEVERAGE_OVERRIDE_COUNT (64) and
+// MAX_ALLOWED_INSTRUMENT_COUNT (1024) in propify-sandbox-abi. A list claiming more than
+// its cap is malformed and decodes with ok == false, exactly as the host rejects an
+// over-cap count before it can index the static storage below.
+const (
+	maxLeverageOverrideCount  = 64
+	maxAllowedInstrumentCount = 1024
+)
+
+// DrawdownRule is the resolved drawdown rule inside an AccountContext (ABI v3): the kind
+// discriminant plus three host-computed decimals. Floor is the authoritative current
+// line the bot should act on; for a Trailing account it already reflects the high-water
+// mark, for a Static account it is the fixed anchor minus the limit. Kind is carried as a
+// raw uint8 discriminant (DrawdownKindStatic/DrawdownKindTrailing), mirroring how the
+// other enums ride as raw bytes on this boundary.
+type DrawdownRule struct {
+	Kind          uint8
+	Limit         Decimal
+	Floor         Decimal
+	HighWaterMark Decimal
+}
+
+// LeverageOverride is one per-asset-class leverage cap: the asset-class name (a sub-slice
+// aliasing the host-written input buffer, no copy) and the cap. It mirrors the Rust
+// (String, Decimal) override pair.
+type LeverageOverride struct {
+	AssetClass []byte
+	Cap        Decimal
+}
+
+// AccountContext is the read-only account context handed to a v3 bot each tick: the
+// lifecycle status plus the resolved rule set (daily-loss floor, drawdown kind and floor,
+// leverage caps, allowed instruments). The in-bot rules are for ADAPTATION, not trust —
+// host-side risk remains the sole backstop — so a well-behaved bot can size down near a
+// floor or respect a leverage cap, but cannot exceed a limit by ignoring it.
+//
+// Status is a raw AccountStatus discriminant. LeverageOverrides aliases the static
+// leverageOverrideStorage and AllowedInstruments aliases allowedInstrumentStorage, and
+// each instrument/asset-class slice aliases the host-written input buffer, so the decode
+// allocates no Go heap.
+type AccountContext struct {
+	Status             uint8
+	DailyLossLimit     Decimal
+	DailyLossFloor     Decimal
+	Drawdown           DrawdownRule
+	DefaultLeverage    Decimal
+	LeverageOverrides  []LeverageOverride
+	AllowedInstruments [][]byte
+}
+
+// tickContext, leverageOverrideStorage and allowedInstrumentStorage are the static decode
+// targets for the account context, mirroring tickWindow/candleStorage. Returning the
+// address of a freshly built context, or building the lists with make/append, would escape
+// onto the Go heap, which traps without `_initialize`. A package-level struct plus
+// fixed-size arrays keep every decoded element in the data/bss segment — no heap. They
+// hold only this tick's data: the host re-instantiates per tick, resetArena runs at tick
+// start, and the single-threaded guest never races on them.
+var (
+	tickContext              AccountContext
+	leverageOverrideStorage  [maxLeverageOverrideCount]LeverageOverride
+	allowedInstrumentStorage [maxAllowedInstrumentCount][]byte
+)
+
+// decodeAccountContext decodes an account context from v3 wire bytes, mirroring the host
+// codec's byte layout EXACTLY: status (u8), daily_loss_limit and daily_loss_floor
+// (Decimal), the inline DrawdownRule (kind u8 + 3 Decimals), default_leverage (Decimal), a
+// u32-count-prefixed list of (asset_class String, cap Decimal) overrides, and a
+// u32-count-prefixed list of allowed-instrument Strings. It returns ok == false — so the
+// driver skips the tick rather than act on garbage — on a truncated buffer or an over-cap
+// count. Enum discriminants ride as raw bytes (the host is the trusted producer and always
+// sends valid values), consistent with how Decimal ranges are likewise carried unchecked.
+// The lists are written into the static storage and the returned context aliases it, so
+// the decode never touches the Go heap.
+func decodeAccountContext(buf []byte) (*AccountContext, bool) {
+	r := NewReader(buf)
+	status := r.readU8()
+	dailyLossLimit := r.readDecimal()
+	dailyLossFloor := r.readDecimal()
+	drawdownKind := r.readU8()
+	drawdownLimit := r.readDecimal()
+	drawdownFloor := r.readDecimal()
+	drawdownHWM := r.readDecimal()
+	defaultLeverage := r.readDecimal()
+	if r.failed {
+		return nil, false
+	}
+
+	overrideCount := r.readU32()
+	if r.failed {
+		return nil, false
+	}
+	// Reject an over-cap count exactly as the host does, before it can index the array.
+	if overrideCount > maxLeverageOverrideCount {
+		return nil, false
+	}
+	for i := uint32(0); i < overrideCount; i++ {
+		assetClass := r.readString()
+		leverageCap := r.readDecimal()
+		if r.failed {
+			return nil, false
+		}
+		leverageOverrideStorage[i] = LeverageOverride{AssetClass: assetClass, Cap: leverageCap}
+	}
+
+	instrumentCount := r.readU32()
+	if r.failed {
+		return nil, false
+	}
+	if instrumentCount > maxAllowedInstrumentCount {
+		return nil, false
+	}
+	for i := uint32(0); i < instrumentCount; i++ {
+		instrument := r.readString()
+		if r.failed {
+			return nil, false
+		}
+		allowedInstrumentStorage[i] = instrument
+	}
+
+	tickContext = AccountContext{
+		Status:             status,
+		DailyLossLimit:     dailyLossLimit,
+		DailyLossFloor:     dailyLossFloor,
+		Drawdown:           DrawdownRule{Kind: drawdownKind, Limit: drawdownLimit, Floor: drawdownFloor, HighWaterMark: drawdownHWM},
+		DefaultLeverage:    defaultLeverage,
+		LeverageOverrides:  leverageOverrideStorage[:overrideCount],
+		AllowedInstruments: allowedInstrumentStorage[:instrumentCount],
+	}
+	return &tickContext, true
 }
 
 // OrderIntentBody is the intent a bot emits: an order minus the two fields the guest

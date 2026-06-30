@@ -29,14 +29,13 @@ package propify
 import "unsafe"
 
 // arenaSize is the fixed capacity of the guest's bump arena, in bytes. MAX_MESSAGE_BYTES
-// is 64 KiB. The largest per-tick message is the ABI v2 market window: 256 candles ×
-// 108 bytes + a short asset header is ~27.7 KiB, comfortably under the 64 KiB cap. A
-// worst-case tick bumps four read buffers (market, window, params, account — each its
-// 256-byte initial guess plus, on the window, a ~27.7 KiB retry alloc, since the bump
-// allocator does not reclaim the discarded guess) and the 64 KiB emit reservation:
-// roughly 256 + (256 + 27_664) + 256 + 256 + 65_536 ≈ 94 KiB. That fits inside this
-// 512 KiB arena with wide margin, so the v2 window needs no bump. It costs only reserved
-// linear memory, which is cheap.
+// is 64 KiB, the ceiling on any single wire message. A worst-case v3 tick bumps five read
+// buffers (market, window, params, account, context — each its 256-byte initial guess
+// plus, when a message exceeds the guess, a retry alloc up to MAX_MESSAGE_BYTES, since the
+// bump allocator does not reclaim the discarded guess) and the 64 KiB emit reservation.
+// Even bounding both the window and the context retries at the full 64 KiB cap, the total
+// (~5 × 256 + 2 × 65_536 + 65_536 ≈ 198 KiB) fits inside this 512 KiB arena with wide
+// margin. It costs only reserved linear memory, which is cheap.
 const arenaSize int32 = 512 * 1024
 
 // maxMessageBytes mirrors the host's MAX_MESSAGE_BYTES (`crate::config`): the largest
@@ -103,10 +102,12 @@ func pin(buf []byte) uintptr {
 }
 
 // AbiVersion backs the `abi_version` export: the ABI major version this SDK targets
-// (2 for the multi-candle window). It matches `propify-sandbox-abi::ABI_VERSION`; the
-// host dual-supports v1 and v2 guests and refuses any other value before a tick runs.
+// (3, the single supported version). It matches `propify-sandbox-abi::ABI_VERSION`; the
+// host accepts only guests reporting 3 (the v1/v2 dual-support path is dropped) and
+// refuses any other value before a tick runs. v3 adds the read-only AccountContext and
+// the embedded manifest section.
 func AbiVersion() int32 {
-	return 2
+	return 3
 }
 
 // Alloc backs the `alloc` export: reserve `size` bytes in linear memory and return the

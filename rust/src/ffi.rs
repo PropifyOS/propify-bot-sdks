@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn host_read_market_window(ptr: i32, len: i32) -> i32;
     fn host_read_strategy_params(ptr: i32, len: i32) -> i32;
     fn host_read_account_view(ptr: i32, len: i32) -> i32;
+    fn host_read_account_context(ptr: i32, len: i32) -> i32;
     fn host_emit_intent(ptr: i32, len: i32) -> i32;
 }
 
@@ -104,6 +105,13 @@ impl HostBindings for WasmHost {
     fn read_account_view(&mut self, ptr: u32, len: u32) -> i32 {
         // SAFETY: as above; a host import operating on our buffer at `(ptr, len)`.
         unsafe { host_read_account_view(ptr as i32, len as i32) }
+    }
+
+    fn read_account_context(&mut self, ptr: u32, len: u32) -> i32 {
+        // SAFETY: as above; the ABI v3 host import operating on our buffer at
+        // `(ptr, len)`, writing the encoded account context there and returning a
+        // length/status.
+        unsafe { host_read_account_context(ptr as i32, len as i32) }
     }
 
     fn emit_intent(&mut self, ptr: u32, len: u32) -> i32 {

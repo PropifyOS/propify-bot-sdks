@@ -312,3 +312,208 @@ func TestStrategyParamsFindReturnsIndependentValues(t *testing.T) {
 		t.Errorf("Find(missing) = (%+v, %v), want (zero Decimal, false)", got, ok)
 	}
 }
+
+// --- ABI v3: AccountContext decoder ------------------------------------------
+//
+// Same hand-rolled, codec-independent fixture style as the window tests above. The
+// canonical AccountContext wire layout mirrored here (and the host/Rust codec exactly):
+//
+//	AccountContext = status u8 + daily_loss_limit Decimal + daily_loss_floor Decimal
+//	                 + DrawdownRule + default_leverage Decimal
+//	                 + u32 override count + count*(asset_class String, cap Decimal)
+//	                 + u32 instrument count + count*String
+//	DrawdownRule   = kind u8 + limit Decimal + floor Decimal + high_water_mark Decimal
+
+func putU8(b *[]byte, v uint8) {
+	*b = append(*b, v)
+}
+
+// leverageOverrideFixture is one (asset_class, cap) override as fixture values.
+type leverageOverrideFixture struct {
+	assetClass string
+	cap        dec
+}
+
+// buildAccountContext assembles canonical AccountContext bytes from fixture values.
+func buildAccountContext(
+	status uint8,
+	dailyLossLimit, dailyLossFloor dec,
+	drawdownKind uint8,
+	drawdownLimit, drawdownFloor, drawdownHWM dec,
+	defaultLeverage dec,
+	overrides []leverageOverrideFixture,
+	instruments []string,
+) []byte {
+	var b []byte
+	putU8(&b, status)
+	putDecimal(&b, dailyLossLimit)
+	putDecimal(&b, dailyLossFloor)
+	putU8(&b, drawdownKind)
+	putDecimal(&b, drawdownLimit)
+	putDecimal(&b, drawdownFloor)
+	putDecimal(&b, drawdownHWM)
+	putDecimal(&b, defaultLeverage)
+	putU32(&b, uint32(len(overrides)))
+	for _, o := range overrides {
+		putString(&b, o.assetClass)
+		putDecimal(&b, o.cap)
+	}
+	putU32(&b, uint32(len(instruments)))
+	for _, s := range instruments {
+		putString(&b, s)
+	}
+	return b
+}
+
+// Representative fixture decimals reused across the context tests.
+var (
+	ctxDailyLimit = dec{low: 2000, high: 0, scale: 0}                    // 2000
+	ctxDailyFloor = dec{low: 9_800_025, high: 0, scale: 2}               // 98000.25
+	ctxDdLimit    = dec{low: 4000, high: 0, scale: 0}                    // 4000
+	ctxDdFloor    = dec{low: 9_600_050, high: 0, scale: 2}               // 96000.50
+	ctxDdHWM      = dec{low: 100_000, high: 0, scale: 0}                 // 100000
+	ctxDefaultLev = dec{low: 2, high: 0, scale: 0}                       // 2
+	ctxBtcCap     = dec{low: 5, high: 0, scale: 0}                       // 5
+	ctxOtherCap   = dec{low: ^uint64(2) + 1, high: ^uint64(0), scale: 0} // -2 (i128), proves negative carriage
+)
+
+func TestDecodeAccountContextPopulated(t *testing.T) {
+	overrides := []leverageOverrideFixture{
+		{assetClass: "BTC", cap: ctxBtcCap},
+		{assetClass: "crypto", cap: ctxOtherCap},
+	}
+	instruments := []string{"BTC", "ETH", "SOL"}
+	buf := buildAccountContext(
+		AccountStatusFunded,
+		ctxDailyLimit, ctxDailyFloor,
+		DrawdownKindTrailing, ctxDdLimit, ctxDdFloor, ctxDdHWM,
+		ctxDefaultLev, overrides, instruments,
+	)
+
+	ctx, ok := decodeAccountContext(buf)
+	if !ok {
+		t.Fatalf("decodeAccountContext returned ok == false for a valid populated context")
+	}
+	if ctx.Status != AccountStatusFunded {
+		t.Errorf("status got %d, want %d", ctx.Status, AccountStatusFunded)
+	}
+	assertDecimal(t, "daily_loss_limit", ctx.DailyLossLimit, ctxDailyLimit)
+	assertDecimal(t, "daily_loss_floor", ctx.DailyLossFloor, ctxDailyFloor)
+	if ctx.Drawdown.Kind != DrawdownKindTrailing {
+		t.Errorf("drawdown.kind got %d, want %d", ctx.Drawdown.Kind, DrawdownKindTrailing)
+	}
+	assertDecimal(t, "drawdown.limit", ctx.Drawdown.Limit, ctxDdLimit)
+	assertDecimal(t, "drawdown.floor", ctx.Drawdown.Floor, ctxDdFloor)
+	assertDecimal(t, "drawdown.high_water_mark", ctx.Drawdown.HighWaterMark, ctxDdHWM)
+	assertDecimal(t, "default_leverage", ctx.DefaultLeverage, ctxDefaultLev)
+
+	if len(ctx.LeverageOverrides) != len(overrides) {
+		t.Fatalf("override count got %d, want %d", len(ctx.LeverageOverrides), len(overrides))
+	}
+	// Aliases the static storage: proves the heap-free contract.
+	if &ctx.LeverageOverrides[0] != &leverageOverrideStorage[0] {
+		t.Errorf("overrides must alias the static leverageOverrideStorage (heap-free contract)")
+	}
+	for i, want := range overrides {
+		if string(ctx.LeverageOverrides[i].AssetClass) != want.assetClass {
+			t.Errorf("override[%d].asset_class got %q, want %q",
+				i, string(ctx.LeverageOverrides[i].AssetClass), want.assetClass)
+		}
+		assertDecimal(t, "override["+itoa(i)+"].cap", ctx.LeverageOverrides[i].Cap, want.cap)
+	}
+
+	if len(ctx.AllowedInstruments) != len(instruments) {
+		t.Fatalf("instrument count got %d, want %d", len(ctx.AllowedInstruments), len(instruments))
+	}
+	if &ctx.AllowedInstruments[0] != &allowedInstrumentStorage[0] {
+		t.Errorf("instruments must alias the static allowedInstrumentStorage (heap-free contract)")
+	}
+	for i, want := range instruments {
+		if string(ctx.AllowedInstruments[i]) != want {
+			t.Errorf("instrument[%d] got %q, want %q", i, string(ctx.AllowedInstruments[i]), want)
+		}
+	}
+}
+
+func TestDecodeAccountContextEmptyLists(t *testing.T) {
+	// No overrides and no allowed instruments: both count prefixes are zero. It must
+	// decode successfully with empty slices — a valid context, not a failure.
+	buf := buildAccountContext(
+		AccountStatusEvaluation,
+		ctxDailyLimit, ctxDailyFloor,
+		DrawdownKindStatic, ctxDdLimit, ctxDdFloor, ctxDdHWM,
+		ctxDefaultLev, nil, nil,
+	)
+	ctx, ok := decodeAccountContext(buf)
+	if !ok {
+		t.Fatalf("a context with empty lists must decode with ok == true")
+	}
+	if ctx.Status != AccountStatusEvaluation {
+		t.Errorf("status got %d, want %d", ctx.Status, AccountStatusEvaluation)
+	}
+	if ctx.Drawdown.Kind != DrawdownKindStatic {
+		t.Errorf("drawdown.kind got %d, want %d", ctx.Drawdown.Kind, DrawdownKindStatic)
+	}
+	if len(ctx.LeverageOverrides) != 0 {
+		t.Errorf("override count got %d, want 0", len(ctx.LeverageOverrides))
+	}
+	if len(ctx.AllowedInstruments) != 0 {
+		t.Errorf("instrument count got %d, want 0", len(ctx.AllowedInstruments))
+	}
+}
+
+func TestDecodeAccountContextOverCapOverrideRejected(t *testing.T) {
+	// An override count of 65 exceeds maxLeverageOverrideCount (64). The decoder must
+	// reject it (ok == false) before indexing the 64-slot array — exactly as the host does.
+	var buf []byte
+	putU8(&buf, AccountStatusEvaluation)
+	putDecimal(&buf, ctxDailyLimit)
+	putDecimal(&buf, ctxDailyFloor)
+	putU8(&buf, DrawdownKindStatic)
+	putDecimal(&buf, ctxDdLimit)
+	putDecimal(&buf, ctxDdFloor)
+	putDecimal(&buf, ctxDdHWM)
+	putDecimal(&buf, ctxDefaultLev)
+	putU32(&buf, maxLeverageOverrideCount+1) // 65
+	// No override bytes needed: the over-cap check fires before any pair is read.
+	if _, ok := decodeAccountContext(buf); ok {
+		t.Errorf("an over-cap override count (65 > 64) must decode with ok == false")
+	}
+}
+
+func TestDecodeAccountContextOverCapInstrumentRejected(t *testing.T) {
+	// A valid (empty) override list, then an instrument count of 1025 exceeding
+	// maxAllowedInstrumentCount (1024). The decoder must reject it (ok == false).
+	var buf []byte
+	putU8(&buf, AccountStatusEvaluation)
+	putDecimal(&buf, ctxDailyLimit)
+	putDecimal(&buf, ctxDailyFloor)
+	putU8(&buf, DrawdownKindStatic)
+	putDecimal(&buf, ctxDdLimit)
+	putDecimal(&buf, ctxDdFloor)
+	putDecimal(&buf, ctxDdHWM)
+	putDecimal(&buf, ctxDefaultLev)
+	putU32(&buf, 0)                           // no overrides
+	putU32(&buf, maxAllowedInstrumentCount+1) // 1025
+	if _, ok := decodeAccountContext(buf); ok {
+		t.Errorf("an over-cap instrument count (1025 > 1024) must decode with ok == false")
+	}
+}
+
+func TestDecodeAccountContextTruncatedRejected(t *testing.T) {
+	// The header promises one override but the buffer ends after the count: the bounded
+	// reader must fail (ok == false) rather than read past the end.
+	var buf []byte
+	putU8(&buf, AccountStatusFunded)
+	putDecimal(&buf, ctxDailyLimit)
+	putDecimal(&buf, ctxDailyFloor)
+	putU8(&buf, DrawdownKindTrailing)
+	putDecimal(&buf, ctxDdLimit)
+	putDecimal(&buf, ctxDdFloor)
+	putDecimal(&buf, ctxDdHWM)
+	putDecimal(&buf, ctxDefaultLev)
+	putU32(&buf, 1) // promises one override, but nothing follows
+	if _, ok := decodeAccountContext(buf); ok {
+		t.Errorf("a context promising more data than the buffer holds must decode with ok == false")
+	}
+}

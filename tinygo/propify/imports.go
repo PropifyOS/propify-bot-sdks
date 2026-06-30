@@ -1,6 +1,6 @@
 //go:build tinygo
 
-// The host capability imports the ABI permits — four under v1, five under v2.
+// The host capability imports the ABI permits — six under v3.
 //
 // Each is declared bodyless with a `//go:wasmimport propify <name>` directive, so it
 // lands in the `propify` import module under the exact name the host's import
@@ -9,8 +9,10 @@
 // ABI requires.
 //
 // host_read_market_window is the ABI v2 addition: it serves the bounded multi-candle
-// window alongside the single-candle snapshot. A snapshot-only bot keeps reading
-// host_read_market_data; a window-aware bot also reads the window.
+// window alongside the single-candle snapshot. host_read_account_context is the ABI v3
+// addition: it serves the read-only account context (status plus the resolved rule set).
+// A snapshot-only bot keeps reading host_read_market_data; a window- or context-aware bot
+// also reads those.
 //
 // The blank `unsafe` import is the toolchain's required marker for a file that uses
 // `//go:wasmimport`; it pulls in no code.
@@ -38,6 +40,9 @@ func hostReadStrategyParams(ptr int32, length int32) int32
 
 //go:wasmimport propify host_read_account_view
 func hostReadAccountView(ptr int32, length int32) int32
+
+//go:wasmimport propify host_read_account_context
+func hostReadAccountContext(ptr int32, length int32) int32
 
 //go:wasmimport propify host_emit_intent
 func hostEmitIntent(ptr int32, length int32) int32

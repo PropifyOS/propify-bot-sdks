@@ -5,8 +5,8 @@
 // package wires the four ABI exports to the helpers here (Go has no macro system, so
 // the wiring is a handful of one-line exported functions instead of Rust's
 // `register_bot!`). The driver performs the read -> OnTick -> emit plumbing against the
-// host imports (four under v1, five under v2 with the window read), exactly like the
-// Rust `run_tick` does against its `HostBindings`.
+// six host imports (the v2 window read and the v3 account-context read included), exactly
+// like the Rust `run_tick` does against its `HostBindings`.
 package propify
 
 // initialReadCapacity is the initial size, in bytes, of the buffer the SDK allocates
@@ -28,8 +28,15 @@ const initialReadCapacity int32 = 256
 // indicator from it each tick. During live warm-up the window is shorter (and may be
 // empty); the SDK hands it through as-is and the bot decides how to handle a short window
 // — the SDK does not special-case warm-up.
+//
+// context (ABI v3) is the read-only account context: the lifecycle status plus the
+// resolved rule set (daily-loss floor, drawdown kind and floor, leverage caps, allowed
+// instruments). It is for adaptation, not trust — host-side risk remains the sole
+// backstop — so a well-behaved bot can size down near a floor or respect a leverage cap,
+// but cannot exceed a limit by ignoring it. A bot that does not care about the rules
+// simply ignores it.
 type Bot interface {
-	OnTick(market *MarketSnapshot, window *MarketWindow, params *StrategyParams, account *AccountView) *OrderIntentBody
+	OnTick(market *MarketSnapshot, window *MarketWindow, params *StrategyParams, account *AccountView, context *AccountContext) *OrderIntentBody
 }
 
 // The host read imports cannot be taken as values directly (a `//go:wasmimport`
@@ -40,6 +47,7 @@ func readMarketData(ptr, length int32) int32     { return hostReadMarketData(ptr
 func readMarketWindow(ptr, length int32) int32   { return hostReadMarketWindow(ptr, length) }
 func readStrategyParams(ptr, length int32) int32 { return hostReadStrategyParams(ptr, length) }
 func readAccountView(ptr, length int32) int32    { return hostReadAccountView(ptr, length) }
+func readAccountContext(ptr, length int32) int32 { return hostReadAccountContext(ptr, length) }
 
 // readSnapshot reads one host snapshot using the documented alloc + single-retry
 // protocol.
@@ -107,8 +115,8 @@ func emitIntent(body *OrderIntentBody) {
 	hostEmitIntent(int32(ptr), int32(len(bytes)))
 }
 
-// RunTick runs one tick: read the four inputs (market, ABI v2 window, params, account),
-// call the bot, emit any returned intent.
+// RunTick runs one tick: read the five inputs (market, ABI v2 window, params, account,
+// ABI v3 context), call the bot, emit any returned intent.
 //
 // If any read fails (a host error or a truncated message), the tick does nothing
 // rather than guessing — there is no partial state to leak, since the host
@@ -116,10 +124,11 @@ func emitIntent(body *OrderIntentBody) {
 // leaking allocator reclaims them when the instance is torn down at tick end, and the
 // decoded asset slice and any parameter lookups alias those buffers until then.
 //
-// The window is read through the same alloc + single-retry protocol as the snapshot. A
-// short or empty window (live warm-up) decodes fine and is handed to the bot as-is; an
-// over-cap or malformed window decodes with ok == false and aborts the tick with no
-// order, matching how a malformed snapshot fails safe.
+// The window and the account context are read through the same alloc + single-retry
+// protocol as the snapshot. A short or empty window (live warm-up) decodes fine and is
+// handed to the bot as-is; an over-cap or malformed window or context decodes with
+// ok == false and aborts the tick with no order, matching how a malformed snapshot fails
+// safe.
 func RunTick(bot Bot) {
 	// Rewind the bump arena so this tick starts from a clean, deterministic state. The
 	// host re-instantiates per tick (which already zeroes the cursor), so this is belt-
@@ -148,18 +157,24 @@ func RunTick(bot Bot) {
 		return
 	}
 
+	contextBuf, failed := readSnapshot(readAccountContext, initialReadCapacity)
+	if failed {
+		return
+	}
+
 	market, okMarket := decodeMarketSnapshot(marketBuf)
 	window, okWindow := decodeMarketWindow(windowBuf)
 	tickParams.buf = paramsBuf
 	params := &tickParams
 	account, okAccount := decodeAccountView(accountBuf)
+	context, okContext := decodeAccountContext(contextBuf)
 
-	// A malformed market, window, or account message aborts the tick with no emission.
-	// The asset slices, candle values, and any parameter lookups still alias the live
-	// buffers (or the static candle storage), so the encode below is valid for the rest
-	// of the tick.
-	if okMarket && okWindow && okAccount {
-		body := bot.OnTick(market, window, params, account)
+	// A malformed market, window, account, or context message aborts the tick with no
+	// emission. The asset slices, candle values, override/instrument slices, and any
+	// parameter lookups still alias the live buffers (or the static storage), so the
+	// encode below is valid for the rest of the tick.
+	if okMarket && okWindow && okAccount && okContext {
+		body := bot.OnTick(market, window, params, account, context)
 		if body != nil {
 			emitIntent(body)
 		}

@@ -10,8 +10,14 @@
 # (a creator cloning just one crate must be able to read and build it standalone),
 # and they must stay that way. This root manifest only groups them for discovery.
 #
+# `tools/manifest-encoder` is a host-side build tool (a `publish = false` binary): it
+# encodes the canonical `propify_manifest` bytes and injects the custom section for the
+# AssemblyScript and TinyGo SDKs, which have no native link-section attribute. It is a
+# workspace member so it shares the lockfile and resolves the sibling `abi/` crate by
+# path; it is never pulled by a git-dependency consumer (those reference packages by name).
+#
 # The `assemblyscript/` and `tinygo/` directories are not Cargo crates and are not
 # members of this workspace.
 [workspace]
 resolver = "2"
-members = ["abi", "rust"]
+members = ["abi", "rust", "tools/manifest-encoder"]

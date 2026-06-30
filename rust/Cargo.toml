@@ -20,10 +20,17 @@ unsafe_code = "deny"
 all = "warn"
 
 [dependencies]
-# The ONLY dependency: the shared codec (DTOs, the six enums, `CodecError`). Inside
+# The ONLY dependency: the shared codec (DTOs, the eight enums, `CodecError`). Inside
 # this repository the sibling `abi/` crate resolves by path. Taken with the abi crate's
 # default features, which leave its `serde` feature OFF, so a guest compiled to wasm
 # never pulls serde.
+propify-sandbox-abi = { path = "../abi" }
+
+[build-dependencies]
+# The build script encodes the bundled example's `BotManifest` into the canonical
+# `propify_manifest` bytes (see build.rs). It needs the same shared codec, on the HOST
+# this time (build scripts run on the host), so it is a build-dependency as well as a
+# normal dependency. A downstream bot crate adds this exact build-dependency line.
 propify-sandbox-abi = { path = "../abi" }
 
 [dev-dependencies]

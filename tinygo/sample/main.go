@@ -47,10 +47,12 @@ func (SampleBot) OnTick(
 	window *propify.MarketWindow,
 	params *propify.StrategyParams,
 	account *propify.AccountView,
+	context *propify.AccountContext,
 ) *propify.OrderIntentBody {
-	// The sample is a snapshot-only bot: it ignores the ABI v2 window and decides from
-	// the latest candle alone.
+	// The sample is a snapshot-only bot: it ignores the ABI v2 window and the ABI v3
+	// account context and decides from the latest candle alone.
 	_ = window
+	_ = context
 	// Find returns the size by value plus a found flag, so the lookup needs no pointer
 	// and no heap. When the parameter is absent, fall back to the fixed default.
 	quantity, ok := params.Find(quantityName)

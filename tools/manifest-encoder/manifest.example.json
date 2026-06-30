@@ -1,0 +1,11 @@
+{
+  "name": "Sample Bot",
+  "description": "A sample PropifyOS bot whose manifest is injected post-build.",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "image_sha256": null,
+  "author_name": "PropifyOS",
+  "author_email": "bots@propifyos.app",
+  "author_erc20": "0x52908400098527886E0F7030069857D2E4169EE7",
+  "source_repo_url": "https://github.com/PropifyOS/propify-bot-sdks"
+}

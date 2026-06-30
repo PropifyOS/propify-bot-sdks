@@ -1848,6 +1848,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn account_context_over_cap_asset_class_string_is_rejected_as_oversized() {
+        // A single override whose asset-class string is one byte over its per-field cap.
+        // The tighter `MAX_ASSET_CLASS_BYTES` cap (not the global 1024) must fire, and it
+        // fires on the length prefix before any string bytes are read.
+        let over = MAX_ASSET_CLASS_BYTES + 1;
+        let mut bytes = Vec::new();
+        put_account_status(&mut bytes, AccountStatus::Evaluation);
+        put_decimal(&mut bytes, dec!(0));
+        put_decimal(&mut bytes, dec!(0));
+        put_drawdown_rule(&mut bytes, &sample_drawdown());
+        put_decimal(&mut bytes, dec!(0));
+        put_u32(&mut bytes, 1); // one override follows
+        put_string(&mut bytes, &"a".repeat(over));
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::Oversized {
+                size: over,
+                limit: MAX_ASSET_CLASS_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn account_context_over_cap_allowed_instrument_string_is_rejected_as_oversized() {
+        // An empty override list, then one allowed-instrument string one byte over the
+        // global `MAX_STRING_BYTES` cap (the list uses the default `read_string`). The
+        // length prefix is refused before any string bytes are read.
+        let over = MAX_STRING_BYTES + 1;
+        let mut bytes = Vec::new();
+        put_account_status(&mut bytes, AccountStatus::Evaluation);
+        put_decimal(&mut bytes, dec!(0));
+        put_decimal(&mut bytes, dec!(0));
+        put_drawdown_rule(&mut bytes, &sample_drawdown());
+        put_decimal(&mut bytes, dec!(0));
+        put_u32(&mut bytes, 0); // no overrides
+        put_u32(&mut bytes, 1); // one instrument follows
+        put_string(&mut bytes, &"a".repeat(over));
+        assert_eq!(
+            AccountContext::decode(&bytes),
+            Err(CodecError::Oversized {
+                size: over,
+                limit: MAX_STRING_BYTES,
+            })
+        );
+    }
+
     // --- ABI v3: BotManifest -------------------------------------------------
 
     /// A representative, valid manifest (every field within its cap) for tests.

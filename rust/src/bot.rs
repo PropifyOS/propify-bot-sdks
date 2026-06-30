@@ -6,7 +6,8 @@
 //! the alloc + single-retry read and the encode + emit — be unit-tested off-target.
 
 use propify_sandbox_abi::{
-    AccountView, CodecError, MarketSnapshot, MarketWindow, OrderIntentBody, StrategyParams,
+    AccountContext, AccountView, CodecError, MarketSnapshot, MarketWindow, OrderIntentBody,
+    StrategyParams,
 };
 
 /// Initial size, in bytes, of the buffer the SDK allocates before a host read.
@@ -42,12 +43,20 @@ pub trait Bot {
     /// warm-up, before enough candles exist, the window is shorter (and may be empty);
     /// the SDK passes it through unchanged and the bot decides how to handle a short
     /// window — the SDK does not special-case warm-up.
+    ///
+    /// `context` (ABI v3) is the read-only account context: the lifecycle status plus the
+    /// resolved rule set (daily-loss floor, drawdown kind and floor, leverage caps,
+    /// allowed instruments). It is for *adaptation, not trust* — host-side risk remains
+    /// the sole backstop and enforces every limit regardless — so a well-behaved bot can
+    /// size down near a floor or respect a leverage cap, but cannot exceed a limit by
+    /// ignoring it. A bot that does not care about the rules simply ignores it.
     fn on_tick(
         &mut self,
         market: &MarketSnapshot,
         window: &MarketWindow,
         params: &StrategyParams,
         account: &AccountView,
+        context: &AccountContext,
     ) -> Option<OrderIntentBody>;
 }
 
@@ -72,6 +81,9 @@ pub trait HostBindings {
     fn read_strategy_params(&mut self, ptr: u32, len: u32) -> i32;
     /// `propify::host_read_account_view`.
     fn read_account_view(&mut self, ptr: u32, len: u32) -> i32;
+    /// `propify::host_read_account_context` (ABI v3). Mirrors the other reads: same
+    /// `(ptr, len) -> i32` read protocol, serving the encoded [`AccountContext`].
+    fn read_account_context(&mut self, ptr: u32, len: u32) -> i32;
     /// `propify::host_emit_intent`.
     fn emit_intent(&mut self, ptr: u32, len: u32) -> i32;
     /// Reserve `size` bytes in the guest's linear memory; returns the offset.
@@ -85,17 +97,17 @@ pub trait HostBindings {
     fn store(&mut self, ptr: u32, bytes: &[u8]);
 }
 
-/// Runs one tick: read the four inputs, call the bot, and emit any returned intent.
+/// Runs one tick: read the five inputs, call the bot, and emit any returned intent.
 ///
 /// Invoked by the `on_tick` export that [`register_bot!`](crate::register_bot)
 /// generates. If any read fails (a `-1` host error or a malformed snapshot), the
 /// tick does nothing rather than guessing — there is no partial state to leak, since
 /// the host re-instantiates the module each tick.
 ///
-/// The ABI v2 [`MarketWindow`] is read through the same alloc + single-retry protocol
-/// as the other inputs. A short or empty window (live warm-up) decodes fine and is
-/// handed to the bot as-is; deciding what to do with a short window is the bot's job,
-/// not the SDK's.
+/// The ABI v2 [`MarketWindow`] and the ABI v3 [`AccountContext`] are read through the
+/// same alloc + single-retry protocol as the other inputs. A short or empty window
+/// (live warm-up) decodes fine and is handed to the bot as-is; deciding what to do with
+/// a short window or with the resolved rules is the bot's job, not the SDK's.
 pub fn run_tick<B: Bot, H: HostBindings>(bot: &mut B, host: &mut H) {
     let Some(market) = read_snapshot(
         host,
@@ -129,8 +141,16 @@ pub fn run_tick<B: Bot, H: HostBindings>(bot: &mut B, host: &mut H) {
     ) else {
         return;
     };
+    let Some(context) = read_snapshot(
+        host,
+        |h, ptr, len| h.read_account_context(ptr, len),
+        AccountContext::decode,
+        INITIAL_READ_CAPACITY,
+    ) else {
+        return;
+    };
 
-    if let Some(body) = bot.on_tick(&market, &window, &params, &account) {
+    if let Some(body) = bot.on_tick(&market, &window, &params, &account, &context) {
         emit_intent(host, &body);
     }
 }
@@ -203,7 +223,8 @@ fn emit_intent<H: HostBindings>(host: &mut H, body: &OrderIntentBody) {
 mod tests {
     use super::*;
     use propify_sandbox_abi::{
-        Candle, Exchange, OrderSide, OrderType, PositionSide, ProductType, TimeInForce,
+        AccountStatus, Candle, DrawdownKind, DrawdownRule, Exchange, OrderSide, OrderType,
+        PositionSide, ProductType, TimeInForce,
     };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -220,11 +241,14 @@ mod tests {
         window: Vec<u8>,
         params: Vec<u8>,
         account: Vec<u8>,
+        context: Vec<u8>,
         emitted: Option<Vec<u8>>,
         market_read_calls: u32,
         window_read_calls: u32,
+        context_read_calls: u32,
         force_market_error: bool,
         force_window_error: bool,
+        force_context_error: bool,
     }
 
     impl MockHost {
@@ -240,17 +264,29 @@ mod tests {
                 window: MarketWindow::default().encode(),
                 params,
                 account,
+                // Default to a valid, fully-populated account context so a tick that does
+                // not care about the rules still has one to read, mirroring a v3 host
+                // that always resolves and serves the context.
+                context: sample_context().encode(),
                 emitted: None,
                 market_read_calls: 0,
                 window_read_calls: 0,
+                context_read_calls: 0,
                 force_market_error: false,
                 force_window_error: false,
+                force_context_error: false,
             }
         }
 
         /// Sets the encoded [`MarketWindow`] the mock serves for the window read.
         fn with_window(mut self, window: Vec<u8>) -> Self {
             self.window = window;
+            self
+        }
+
+        /// Sets the encoded [`AccountContext`] the mock serves for the context read.
+        fn with_context(mut self, context: Vec<u8>) -> Self {
+            self.context = context;
             self
         }
     }
@@ -295,6 +331,14 @@ mod tests {
 
         fn read_account_view(&mut self, ptr: u32, len: u32) -> i32 {
             serve(&self.account, &mut self.memory, ptr, len)
+        }
+
+        fn read_account_context(&mut self, ptr: u32, len: u32) -> i32 {
+            self.context_read_calls += 1;
+            if self.force_context_error {
+                return -1;
+            }
+            serve(&self.context, &mut self.memory, ptr, len)
         }
 
         fn emit_intent(&mut self, ptr: u32, len: u32) -> i32 {
@@ -398,6 +442,26 @@ mod tests {
         }
     }
 
+    /// A representative, fully-populated account context the mock serves by default and
+    /// the context-aware bot reads. The drawdown floor is the distinctive figure a bot
+    /// can echo to prove the context reached it decoded.
+    fn sample_context() -> AccountContext {
+        AccountContext {
+            status: AccountStatus::Funded,
+            daily_loss_limit: dec!(2000),
+            daily_loss_floor: dec!(98000.25),
+            drawdown: DrawdownRule {
+                kind: DrawdownKind::Trailing,
+                limit: dec!(4000),
+                floor: dec!(96000.50),
+                high_water_mark: dec!(100000),
+            },
+            default_leverage: dec!(2),
+            leverage_overrides: vec![("BTC".to_string(), dec!(5)), ("ETH".to_string(), dec!(5))],
+            allowed_instruments: vec!["BTC".to_string(), "ETH".to_string()],
+        }
+    }
+
     /// A bot that echoes the market asset and the `"quantity"` param into a market
     /// BUY, ignoring the window, so a passing assertion proves the snapshot path still
     /// works for a simple (window-unaware) bot.
@@ -410,6 +474,7 @@ mod tests {
             _window: &MarketWindow,
             params: &StrategyParams,
             _account: &AccountView,
+            _context: &AccountContext,
         ) -> Option<OrderIntentBody> {
             let quantity = params
                 .params
@@ -445,6 +510,7 @@ mod tests {
             window: &MarketWindow,
             _params: &StrategyParams,
             _account: &AccountView,
+            _context: &AccountContext,
         ) -> Option<OrderIntentBody> {
             let latest = window.candles.last()?;
             Some(OrderIntentBody {
@@ -472,8 +538,38 @@ mod tests {
             _window: &MarketWindow,
             _params: &StrategyParams,
             _account: &AccountView,
+            _context: &AccountContext,
         ) -> Option<OrderIntentBody> {
             None
+        }
+    }
+
+    /// A context-aware bot: it sizes its order by the drawdown `floor` from the account
+    /// context, so a passing assertion proves the ABI v3 context reached the bot decoded.
+    struct ContextBot;
+
+    impl Bot for ContextBot {
+        fn on_tick(
+            &mut self,
+            market: &MarketSnapshot,
+            _window: &MarketWindow,
+            _params: &StrategyParams,
+            _account: &AccountView,
+            context: &AccountContext,
+        ) -> Option<OrderIntentBody> {
+            Some(OrderIntentBody {
+                exchange: Exchange::Hyperliquid,
+                asset: market.asset.clone(),
+                product_type: ProductType::Perp,
+                side: OrderSide::Buy,
+                position_side: PositionSide::Long,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::Ioc,
+                quantity: context.drawdown.floor,
+                price: None,
+                trigger_price: None,
+                reduce_only: false,
+            })
         }
     }
 
@@ -674,6 +770,70 @@ mod tests {
         assert_eq!(
             host.emitted, None,
             "a failed read must abort the tick with no emission"
+        );
+    }
+
+    #[test]
+    fn run_tick_delivers_the_account_context_decoded_to_the_bot() {
+        // `ContextBot` sizes its order by the context's drawdown floor, so a match proves
+        // the ABI v3 account context — read through the same protocol as the other
+        // inputs — reached the bot decoded, and the emitted bytes round-trip.
+        let context = sample_context();
+        let floor = context.drawdown.floor;
+        let mut host = MockHost::new(
+            sample_market().encode(),
+            sample_params().encode(),
+            sample_account().encode(),
+        )
+        .with_context(context.encode());
+
+        run_tick(&mut ContextBot, &mut host);
+
+        let emitted = host.emitted.expect("a bot returning Some must emit");
+        let expected = OrderIntentBody {
+            exchange: Exchange::Hyperliquid,
+            asset: "BTC".to_string(),
+            product_type: ProductType::Perp,
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Ioc,
+            quantity: floor,
+            price: None,
+            trigger_price: None,
+            reduce_only: false,
+        };
+        assert_eq!(
+            emitted,
+            expected.encode(),
+            "the order must be sized by the context's drawdown floor"
+        );
+        assert_eq!(
+            OrderIntentBody::decode(&emitted),
+            Ok(expected),
+            "emitted bytes must decode to the expected body"
+        );
+        assert_eq!(
+            host.context_read_calls, 1,
+            "the account context is read once per tick"
+        );
+    }
+
+    #[test]
+    fn run_tick_does_nothing_when_the_context_read_errors() {
+        // A `-1` internal host error on the context read aborts the tick with no
+        // emission, exactly as a failed market or window read does: no input is guessed.
+        let mut host = MockHost::new(
+            sample_market().encode(),
+            sample_params().encode(),
+            sample_account().encode(),
+        );
+        host.force_context_error = true;
+
+        run_tick(&mut ContextBot, &mut host);
+        assert_eq!(
+            host.emitted, None,
+            "a failed context read must abort the tick with no emission"
         );
     }
 }

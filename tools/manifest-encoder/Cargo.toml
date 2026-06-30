@@ -1,0 +1,20 @@
+[package]
+name = "manifest-encoder"
+# A host-side build tool for the non-Rust SDKs. Apache-2.0 like the rest of the repo.
+version = "0.1.0-BETA.1"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[dependencies]
+propify-sandbox-abi = { version = "0.1.0-BETA.1", path = "../../abi" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+wasmparser = "0.252.0"
