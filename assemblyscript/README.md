@@ -4,9 +4,11 @@ The AssemblyScript toolkit for writing a PropifyOS sandbox bot. You subclass `Bo
 implement `onTick`, and write the four ABI export functions by hand (AssemblyScript has
 no macros). The SDK handles the wire codec and the read and emit protocol.
 
-It targets ABI v2: the `abi_version` export returns `2` and `Bot.onTick` receives the
-v2 `MarketWindow` alongside the latest snapshot. A snapshot-only bot ignores the
-window.
+It targets ABI v3: the `abi_version` export returns `3` and `Bot.onTick` receives the v2
+`MarketWindow` and the v3 read-only `AccountContext` (account status plus the resolved
+rule set) alongside the latest snapshot. A snapshot-only bot ignores both. AssemblyScript
+has no native link-section attribute, so the bot's `propify_manifest` section is injected
+after the build with the `manifest-encoder` tool (see "Bot manifest" below).
 
 ## Prerequisites
 
@@ -45,6 +47,26 @@ The build passes these for correctness, not just size:
 
 The `memory` export is emitted automatically because the build does not pass
 `--importMemory`.
+
+## Bot manifest
+
+AssemblyScript has no native link-section attribute, so the `propify_manifest` custom
+section is injected after the build with the `manifest-encoder` tool (in
+`tools/manifest-encoder`). The injected bytes are the canonical `BotManifest::encode`
+output, so the manifest is byte-identical on rebuild. After building the guest:
+
+```bash
+# Encode your descriptor to canonical bytes, then inject the section.
+cargo run -p manifest-encoder -- encode bot.manifest.json manifest.bin
+cargo run -p manifest-encoder -- inject build/sample.wasm manifest.bin build/sample.with-manifest.wasm
+# Confirm exactly one section that decodes cleanly.
+cargo run -p manifest-encoder -- verify build/sample.with-manifest.wasm
+```
+
+For a reproducible artifact, inject the manifest after `wasm-tools strip -d producers` (the
+last step of `build-repro.sh`) so the section bytes are deterministic. See
+`tools/manifest-encoder/README.md`. The sample ships no manifest, so the default build does
+not inject one; a real bot build runs the steps above.
 
 ## Start your own bot
 

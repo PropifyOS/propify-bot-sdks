@@ -1,0 +1,11 @@
+{
+  "//": "Test-only asc config: builds ONLY the off-target account-context decoder shim (test/account-context-shim.ts), never the sample. Passed explicitly via --config (see test/account-context.test.mjs) so the root asconfig.json — whose entry is assembly/sample.ts — is not auto-discovered and the two modules are not merged. Like the decoder-shim config it does NOT override abort: the shim is a test harness run in Node (not loaded by the frozen-ABI host gate), so an env.abort import is harmless and the test provides a stub for it. The decoders are total and --noAssert strips assertions, so abort is never actually reached.",
+  "entries": ["test/account-context-shim.ts"],
+  "options": {
+    "runtime": "stub",
+    "exportRuntime": false,
+    "noAssert": true,
+    "optimizeLevel": 3,
+    "shrinkLevel": 1
+  }
+}

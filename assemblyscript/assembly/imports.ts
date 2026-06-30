@@ -1,4 +1,4 @@
-// The host capability imports the ABI permits — four under v1, five under v2.
+// The host capability imports the ABI permits — six under v3.
 //
 // Each is declared with `@external("propify", "<name>")` so it lands in the
 // `propify` import module under the exact name the host's import allow-list checks.
@@ -6,8 +6,11 @@
 // `(i32, i32) -> i32` signature.
 //
 // `host_read_market_window` is the ABI v2 addition: it serves the bounded
-// multi-candle window alongside the single-candle snapshot. A snapshot-only bot
-// keeps reading `host_read_market_data`; a window-aware bot also reads the window.
+// multi-candle window alongside the single-candle snapshot. `host_read_account_context`
+// is the ABI v3 addition: it serves the read-only account context (lifecycle status
+// plus the resolved rule set). Both are optional capabilities — a guest that does not
+// read the window or the context simply omits the import; the host wires every
+// capability into the linker regardless.
 //
 // Read functions (`host_read_*`): the guest passes a destination buffer `(ptr,
 // len)`. The host writes the encoded snapshot there and returns its full length `n`.
@@ -29,6 +32,9 @@ export declare function host_read_strategy_params(ptr: i32, len: i32): i32;
 
 @external("propify", "host_read_account_view")
 export declare function host_read_account_view(ptr: i32, len: i32): i32;
+
+@external("propify", "host_read_account_context")
+export declare function host_read_account_context(ptr: i32, len: i32): i32;
 
 @external("propify", "host_emit_intent")
 export declare function host_emit_intent(ptr: i32, len: i32): i32;

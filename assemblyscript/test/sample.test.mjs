@@ -57,6 +57,29 @@ const paramsBytes = (pairs) => {
 
 const accountBytes = (four) => four.flatMap((d) => decBytes(d[0], d[1], d[2]));
 
+// An ABI v3 AccountContext on the wire, mirroring the host codec layout exactly: status
+// (u8), daily_loss_limit + daily_loss_floor (Decimal), the inline DrawdownRule (kind u8 +
+// limit/floor/high_water_mark Decimals), default_leverage (Decimal), a u32-count-prefixed
+// list of (asset_class String, cap Decimal) overrides, and a u32-count-prefixed list of
+// allowed-instrument Strings.
+const contextBytes = (c) => {
+  const out = [
+    c.status,
+    ...decBytes(...c.dailyLossLimit),
+    ...decBytes(...c.dailyLossFloor),
+    c.drawdown.kind,
+    ...decBytes(...c.drawdown.limit),
+    ...decBytes(...c.drawdown.floor),
+    ...decBytes(...c.drawdown.hwm),
+    ...decBytes(...c.defaultLeverage),
+    ...u32le(c.overrides.length),
+  ];
+  for (const o of c.overrides) out.push(...strBytes(o.assetClass), ...decBytes(...o.cap));
+  out.push(...u32le(c.instruments.length));
+  for (const s of c.instruments) out.push(...strBytes(s));
+  return out;
+};
+
 // An ABI v2 candle on the wire: i64 timestamp_ms, then five Decimals (OHLCV).
 const candleBytes = (tsMs, prices) => [...i64le(tsMs), ...prices.flatMap((p) => decBytes(p[0], p[1], p[2]))];
 
@@ -109,13 +132,33 @@ const SAMPLE_PRICES = [
 ];
 
 /**
+ * A representative ABI v3 account context; the snapshot-only sample ignores it but must
+ * still read it. It is small (empty lists) so it fits the initial 256-byte read buffer
+ * with no retry. Its contents do not affect the emission.
+ */
+const SAMPLE_CONTEXT = contextBytes({
+  status: 0, // Evaluation
+  dailyLossLimit: [200000n, 0n, 2], // 2000.00
+  dailyLossFloor: [9800000n, 0n, 2], // 98000.00
+  drawdown: {
+    kind: 0, // Static
+    limit: [500000n, 0n, 2], // 5000.00
+    floor: [9500000n, 0n, 2], // 95000.00
+    hwm: [10000000n, 0n, 2], // 100000.00
+  },
+  defaultLeverage: [2n, 0n, 0], // 2x
+  overrides: [],
+  instruments: [],
+});
+
+/**
  * Instantiates the module with a mock host and runs one tick.
  *
  * The read functions implement the host protocol: write the payload into guest
  * memory when it fits, otherwise write nothing and return the required length so the
  * guest re-allocs and retries. `host_emit_intent` captures the emitted bytes.
  */
-function runTick(module, market, params, account, window = EMPTY_WINDOW) {
+function runTick(module, market, params, account, window = EMPTY_WINDOW, context = SAMPLE_CONTEXT) {
   let emitted = null;
   let instance;
 
@@ -134,6 +177,9 @@ function runTick(module, market, params, account, window = EMPTY_WINDOW) {
       host_read_market_window: serve(window),
       host_read_strategy_params: serve(params),
       host_read_account_view: serve(account),
+      // ABI v3: the host serves the read-only account context. The snapshot-only sample
+      // reads it (so the import must be present) and ignores it.
+      host_read_account_context: serve(context),
       host_emit_intent: (ptr, len) => {
         emitted = Array.from(memU8().subarray(ptr, ptr + len));
         return 0;
@@ -152,13 +198,15 @@ async function loadModule() {
 
 // --- Tests --------------------------------------------------------------------
 
-test("imports exactly the five propify capabilities and nothing else", async () => {
+test("imports exactly the six propify capabilities and nothing else", async () => {
   const module = await loadModule();
   const imports = WebAssembly.Module.imports(module);
   const names = imports.map((i) => `${i.module}::${i.name}`).sort();
-  // Five under ABI v2: the four v1 reads/emit plus the new market-window read.
+  // Six under ABI v3: the four v1 reads/emit, the v2 market-window read, and the new v3
+  // account-context read.
   assert.deepEqual(names, [
     "propify::host_emit_intent",
+    "propify::host_read_account_context",
     "propify::host_read_account_view",
     "propify::host_read_market_data",
     "propify::host_read_market_window",
@@ -182,7 +230,7 @@ test("exports the full ABI surface", async () => {
   assert.equal(byName.get("on_tick"), "function");
 });
 
-test("abi_version returns the ABI v2 value 2", async () => {
+test("abi_version returns the ABI v3 value 3", async () => {
   const module = await loadModule();
   const instance = new WebAssembly.Instance(module, {
     propify: {
@@ -190,10 +238,11 @@ test("abi_version returns the ABI v2 value 2", async () => {
       host_read_market_window: () => 0,
       host_read_strategy_params: () => 0,
       host_read_account_view: () => 0,
+      host_read_account_context: () => 0,
       host_emit_intent: () => 0,
     },
   });
-  assert.equal(instance.exports.abi_version(), 2);
+  assert.equal(instance.exports.abi_version(), 3);
 });
 
 test("emits the exact market-BUY bytes for asset BTC and quantity 0.002", async () => {
@@ -369,6 +418,91 @@ test("recovers via the single-retry path when the first window buffer is too sma
   assert.deepEqual(emitted, expected, "the window retry path must not disturb the emission");
 });
 
+test("serves a populated account context yet the snapshot-only sample emits unchanged", async () => {
+  // A context carrying non-empty leverage overrides and allowed instruments is served. The
+  // sample ignores the context and decides from the snapshot alone, so the emitted bytes
+  // must be byte-identical to the small-context case: proving the ABI v3 account-context
+  // read does not disturb a context-unaware bot.
+  const module = await loadModule();
+  const market = marketBytes("BTC", 1_700_000_000_000n, SAMPLE_PRICES);
+  const params = paramsBytes([["quantity", [2n, 0n, 3]]]);
+  const fullContext = contextBytes({
+    status: 1, // Funded
+    dailyLossLimit: [300000n, 0n, 2],
+    dailyLossFloor: [9700000n, 0n, 2],
+    drawdown: {
+      kind: 1, // Trailing
+      limit: [400000n, 0n, 2],
+      floor: [9600000n, 0n, 2],
+      hwm: [10100000n, 0n, 2],
+    },
+    defaultLeverage: [2n, 0n, 0],
+    overrides: [
+      { assetClass: "BTC", cap: [5n, 0n, 0] },
+      { assetClass: "ETH", cap: [5n, 0n, 0] },
+    ],
+    instruments: ["BTC", "ETH", "SOL"],
+  });
+  const withFull = runTick(module, market, params, SAMPLE_ACCOUNT, EMPTY_WINDOW, fullContext).emitted;
+  const withSmall = runTick(module, market, params, SAMPLE_ACCOUNT).emitted;
+
+  const expected = orderBytes({
+    exchange: 0,
+    asset: "BTC",
+    product: 1,
+    side: 0,
+    pos: 0,
+    otype: 0,
+    tif: 1,
+    qty: [2n, 0n, 3],
+    price: null,
+    trigger: null,
+    reduce: false,
+  });
+  assert.deepEqual(withFull, expected, "a populated context must not change the emission");
+  assert.deepEqual(withFull, withSmall, "context contents must not affect a snapshot-only bot");
+});
+
+test("recovers via the single-retry path when the first context buffer is too small", async () => {
+  // A context with enough allowed instruments to exceed the 256-byte initial read buffer
+  // forces the host to return the required length on the first context read (writing
+  // nothing) and the guest to re-alloc and retry once — the same protocol as every other
+  // read. The sample ignores the context, so a correct emission proves the context retry
+  // path recovered cleanly without corrupting the tick.
+  const module = await loadModule();
+  const market = marketBytes("BTC", 1n, SAMPLE_PRICES);
+  const params = paramsBytes([["quantity", [2n, 0n, 3]]]);
+  // 40 instruments of 4 bytes each (4-byte prefix + 3-byte symbol) plus the fixed header
+  // comfortably exceeds 256 bytes.
+  const instruments = Array.from({ length: 40 }, (_, i) => `I${String(i).padStart(2, "0")}`);
+  const bigContext = contextBytes({
+    status: 0,
+    dailyLossLimit: [200000n, 0n, 2],
+    dailyLossFloor: [9800000n, 0n, 2],
+    drawdown: { kind: 0, limit: [500000n, 0n, 2], floor: [9500000n, 0n, 2], hwm: [10000000n, 0n, 2] },
+    defaultLeverage: [2n, 0n, 0],
+    overrides: [],
+    instruments,
+  });
+  assert.ok(bigContext.length > 256, "the context must exceed the initial read buffer");
+  const { emitted } = runTick(module, market, params, SAMPLE_ACCOUNT, EMPTY_WINDOW, bigContext);
+
+  const expected = orderBytes({
+    exchange: 0,
+    asset: "BTC",
+    product: 1,
+    side: 0,
+    pos: 0,
+    otype: 0,
+    tif: 1,
+    qty: [2n, 0n, 3],
+    price: null,
+    trigger: null,
+    reduce: false,
+  });
+  assert.deepEqual(emitted, expected, "the context retry path must not disturb the emission");
+});
+
 test("does not emit when a read returns the internal host error -1", async () => {
   const module = await loadModule();
   let emitted = null;
@@ -380,6 +514,7 @@ test("does not emit when a read returns the internal host error -1", async () =>
       host_read_market_window: () => 0,
       host_read_strategy_params: () => 0,
       host_read_account_view: () => 0,
+      host_read_account_context: () => 0,
       host_emit_intent: (ptr, len) => {
         emitted = Array.from(memU8().subarray(ptr, ptr + len));
         return 0;

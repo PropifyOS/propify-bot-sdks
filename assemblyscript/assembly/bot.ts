@@ -5,19 +5,21 @@
 // wires the four ABI exports to the helpers here (AS has no macro system, so the
 // wiring is a few one-line `export function`s instead of Rust's `register_bot!`).
 // The driver performs the read -> onTick -> emit plumbing against the host imports
-// (four under v1, five under v2 with the window read), exactly like the Rust
-// `run_tick` does against `HostBindings`.
+// (six under v3: the snapshot, the v2 window, params, the account view, the v3 account
+// context, and the emit), exactly like the Rust `run_tick` does against `HostBindings`.
 
 import {
   host_read_market_data,
   host_read_market_window,
   host_read_strategy_params,
   host_read_account_view,
+  host_read_account_context,
   host_emit_intent,
 } from "./imports";
 import { Decimal } from "./decimal";
 import { Writer } from "./wire";
 import {
+  AccountContext,
   AccountView,
   MarketSnapshot,
   MarketWindow,
@@ -27,10 +29,10 @@ import {
 
 /**
  * The ABI major version this SDK targets, returned by the `abi_version` export.
- * Matches `propify-sandbox-abi::ABI_VERSION` (2 for the multi-candle window); the host
- * dual-supports v1 and v2 guests and refuses any other value before a tick runs.
+ * Matches `propify-sandbox-abi::ABI_VERSION` (3, the single supported version); the host
+ * refuses any guest that does not report exactly 3 before a tick runs.
  */
-export const ABI_VERSION: i32 = 2;
+export const ABI_VERSION: i32 = 3;
 
 /**
  * Initial size, in bytes, of the buffer the SDK allocates before a host read. A
@@ -54,13 +56,20 @@ const INITIAL_READ_CAPACITY: i32 = 256;
  * indicator from it each tick. During live warm-up the window is shorter (and may be
  * empty); the SDK hands it through as-is and the bot decides how to handle a short
  * window — the SDK does not special-case warm-up.
+ *
+ * `context` (ABI v3) is the read-only account context: the lifecycle status plus the
+ * resolved rule set (daily-loss floor, drawdown kind and floor, leverage caps, allowed
+ * instruments). It is for ADAPTATION, not trust — host-side risk still enforces every
+ * limit — so a well-behaved bot can size down near a floor or respect a leverage cap, but
+ * a bot that ignores `context` cannot exceed any limit.
  */
 export abstract class Bot {
   abstract onTick(
     market: MarketSnapshot,
     window: MarketWindow,
     params: StrategyParams,
-    account: AccountView
+    account: AccountView,
+    context: AccountContext
   ): OrderIntentBody | null;
 }
 
@@ -142,18 +151,18 @@ function emitIntent(body: OrderIntentBody): void {
 }
 
 /**
- * Runs one tick: read the four inputs (market, ABI v2 window, params, account), call
- * the bot, emit any returned intent.
+ * Runs one tick: read the five inputs (market, ABI v2 window, params, account, ABI v3
+ * account context), call the bot, emit any returned intent.
  *
  * If any read fails (a host error or a truncated message), the tick does nothing
  * rather than guessing — there is no partial state to leak, since the host
  * re-instantiates the module each tick. Every read buffer is freed before returning
  * (pairing each alloc with one dealloc), after the encode that may alias it.
  *
- * The window is read through the same alloc + single-retry protocol as the snapshot. A
- * short or empty window (live warm-up) decodes fine and is handed to the bot as-is; an
- * over-cap or malformed window decodes to `null` and aborts the tick with no order,
- * matching how a malformed snapshot fails safe.
+ * The window and the account context are each read through the same alloc + single-retry
+ * protocol as the snapshot. A short or empty window (live warm-up) decodes fine and is
+ * handed to the bot as-is; an over-cap or malformed window or context decodes to `null`
+ * and aborts the tick with no order, matching how a malformed snapshot fails safe.
  */
 export function runTick(bot: Bot): void {
   const marketBuf = readSnapshot(host_read_market_data, INITIAL_READ_CAPACITY);
@@ -186,16 +195,37 @@ export function runTick(bot: Bot): void {
     return;
   }
 
+  // ABI v3: read the account context after the account view, through the same
+  // alloc + single-retry protocol every other read uses.
+  const contextBuf = readSnapshot(
+    host_read_account_context,
+    INITIAL_READ_CAPACITY
+  );
+  if (contextBuf.failed) {
+    heap.free(marketBuf.ptr);
+    heap.free(windowBuf.ptr);
+    heap.free(paramsBuf.ptr);
+    heap.free(accountBuf.ptr);
+    return;
+  }
+
   const market = MarketSnapshot.decode(marketBuf.ptr, marketBuf.len);
   const window = MarketWindow.decode(windowBuf.ptr, windowBuf.len);
   const params = new StrategyParams(paramsBuf.ptr, paramsBuf.len);
   const account = AccountView.decode(accountBuf.ptr, accountBuf.len);
+  const context = AccountContext.decode(contextBuf.ptr, contextBuf.len);
 
-  // A malformed market, window, or account message aborts the tick with no emission.
-  // The asset slices, candle bytes, and any param lookups still alias the live buffers,
-  // so the encode below (inside onTick's returned body) is valid until the frees.
-  if (market !== null && window !== null && account !== null) {
-    const body = bot.onTick(market, window, params, account);
+  // A malformed market, window, account, or context message aborts the tick with no
+  // emission. The asset slices, candle bytes, context list slices, and any param lookups
+  // still alias the live buffers, so the encode below (inside onTick's returned body) is
+  // valid until the frees.
+  if (
+    market !== null &&
+    window !== null &&
+    account !== null &&
+    context !== null
+  ) {
+    const body = bot.onTick(market, window, params, account, context);
     if (body !== null) emitIntent(body);
   }
 
@@ -203,6 +233,7 @@ export function runTick(bot: Bot): void {
   heap.free(windowBuf.ptr);
   heap.free(paramsBuf.ptr);
   heap.free(accountBuf.ptr);
+  heap.free(contextBuf.ptr);
 }
 
 // --- ABI export helpers ----------------------------------------------------
@@ -210,7 +241,7 @@ export function runTick(bot: Bot): void {
 // The sample's entry module delegates its `abi_version`/`alloc`/`dealloc` exports to
 // these one-liners so the wiring stays trivial. `on_tick` delegates to `runTick`.
 
-/** Backs the `abi_version` export: returns the ABI v2 version this SDK targets. */
+/** Backs the `abi_version` export: returns the ABI v3 version this SDK targets. */
 export function abiVersion(): i32 {
   return ABI_VERSION;
 }

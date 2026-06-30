@@ -45,6 +45,26 @@ export namespace TimeInForce {
 }
 
 /**
+ * Account lifecycle status (ABI v3, FROZEN). Resolved host-side from the challenge
+ * attempt and carried in an [`AccountContext`]. `Evaluation` is an account still
+ * working a challenge; `Funded` is a passed, funded account.
+ */
+export namespace AccountStatus {
+  export const Evaluation: u8 = 0;
+  export const Funded: u8 = 1;
+}
+
+/**
+ * How the maximum-drawdown floor is computed (ABI v3, FROZEN). `Static` is a fixed
+ * anchor minus the limit; `Trailing` rises with the high-water mark. The host resolves
+ * the kind from the challenge tier (1-step is static, 2-step is trailing).
+ */
+export namespace DrawdownKind {
+  export const Static: u8 = 0;
+  export const Trailing: u8 = 1;
+}
+
+/**
  * A single market observation handed to the bot each tick.
  *
  * `asset` is a [`ByteSlice`] aliasing the host-written input buffer rather than a
@@ -231,6 +251,128 @@ export class AccountView {
     const unrealizedPnl = reader.readDecimal();
     if (reader.failed) return null;
     return new AccountView(equity, availableMargin, exposure, unrealizedPnl);
+  }
+}
+
+/**
+ * Caps on the two count-prefixed lists in an [`AccountContext`] (ABI v3), matching the
+ * host's `MAX_LEVERAGE_OVERRIDE_COUNT` (64) and `MAX_ALLOWED_INSTRUMENT_COUNT` (1024) in
+ * `propify-sandbox-abi`. A list claiming more than its cap is malformed and decodes to
+ * `null`, exactly as the host rejects an over-cap count before trusting it for bounds.
+ */
+export const MAX_LEVERAGE_OVERRIDE_COUNT: i32 = 64;
+export const MAX_ALLOWED_INSTRUMENT_COUNT: i32 = 1024;
+
+/**
+ * The resolved drawdown rule inside an [`AccountContext`] (ABI v3): the kind discriminant
+ * plus three host-computed `Decimal`s. `floor` is the authoritative current line the bot
+ * should act on — for a [`DrawdownKind.Trailing`] account it already reflects the
+ * high-water mark, for a [`DrawdownKind.Static`] account it is the fixed anchor minus the
+ * limit. `kind` rides as a raw `u8` discriminant ([`DrawdownKind`]), mirroring how the
+ * other enums ride as raw bytes on this boundary.
+ */
+export class DrawdownRule {
+  constructor(
+    public kind: u8,
+    public limit: Decimal,
+    public floor: Decimal,
+    public highWaterMark: Decimal
+  ) {}
+}
+
+/**
+ * One per-asset-class leverage cap inside an [`AccountContext`]: the asset-class name
+ * (a [`ByteSlice`] aliasing the host-written input buffer, no copy) and the cap. Mirrors
+ * the Rust `(String, Decimal)` override pair.
+ */
+export class LeverageOverride {
+  constructor(public assetClass: ByteSlice, public cap: Decimal) {}
+}
+
+/**
+ * The read-only account context handed to a v3 bot each tick: the lifecycle status plus
+ * the resolved rule set (daily-loss floor, drawdown kind and floor, leverage caps,
+ * allowed instruments). The in-bot rules are for ADAPTATION, not trust — host-side risk
+ * remains the sole backstop — so a well-behaved bot can size down near a floor or respect
+ * a leverage cap, but a bot that ignores the context cannot exceed any limit.
+ *
+ * `status` is a raw [`AccountStatus`] discriminant. The asset-class names in
+ * `leverageOverrides` and every symbol in `allowedInstruments` are [`ByteSlice`]s aliasing
+ * the host-written input buffer, which the SDK keeps alive for the whole tick.
+ */
+export class AccountContext {
+  constructor(
+    public status: u8,
+    public dailyLossLimit: Decimal,
+    public dailyLossFloor: Decimal,
+    public drawdown: DrawdownRule,
+    public defaultLeverage: Decimal,
+    public leverageOverrides: Array<LeverageOverride>,
+    public allowedInstruments: Array<ByteSlice>
+  ) {}
+
+  /**
+   * Decodes an account context from v3 wire bytes, mirroring the host codec's byte layout
+   * EXACTLY: `status` (`u8`), `dailyLossLimit` and `dailyLossFloor` (`Decimal`), the inline
+   * [`DrawdownRule`] (`kind` `u8` + three `Decimal`s), `defaultLeverage` (`Decimal`), a
+   * `u32`-count-prefixed list of `(assetClass String, cap Decimal)` overrides, and a
+   * `u32`-count-prefixed list of allowed-instrument `String`s.
+   *
+   * Returns `null` — so the driver skips the tick rather than act on garbage — on a
+   * truncated buffer or an over-cap list count. An empty pair of lists decodes
+   * successfully. Enum discriminants (`status`, `drawdown.kind`) ride as raw bytes: the
+   * host is the trusted producer and always sends valid values, the same posture the
+   * existing decoders take for the order enums and unchecked `Decimal` ranges.
+   */
+  static decode(ptr: usize, len: i32): AccountContext | null {
+    const reader = new Reader(ptr, len);
+    const status = reader.readU8();
+    const dailyLossLimit = reader.readDecimal();
+    const dailyLossFloor = reader.readDecimal();
+    const drawdownKind = reader.readU8();
+    const drawdownLimit = reader.readDecimal();
+    const drawdownFloor = reader.readDecimal();
+    const drawdownHwm = reader.readDecimal();
+    const defaultLeverage = reader.readDecimal();
+    if (reader.failed) return null;
+
+    const overrideCount = reader.readU32();
+    if (reader.failed) return null;
+    // Reject an over-cap count exactly as the host does, before sizing the list.
+    if (overrideCount > <u32>MAX_LEVERAGE_OVERRIDE_COUNT) return null;
+    const leverageOverrides = new Array<LeverageOverride>(<i32>overrideCount);
+    for (let i: u32 = 0; i < overrideCount; i++) {
+      const assetClass = reader.readString();
+      const cap = reader.readDecimal();
+      if (reader.failed) return null;
+      leverageOverrides[<i32>i] = new LeverageOverride(assetClass, cap);
+    }
+
+    const instrumentCount = reader.readU32();
+    if (reader.failed) return null;
+    if (instrumentCount > <u32>MAX_ALLOWED_INSTRUMENT_COUNT) return null;
+    const allowedInstruments = new Array<ByteSlice>(<i32>instrumentCount);
+    for (let i: u32 = 0; i < instrumentCount; i++) {
+      const instrument = reader.readString();
+      if (reader.failed) return null;
+      allowedInstruments[<i32>i] = instrument;
+    }
+
+    const drawdown = new DrawdownRule(
+      drawdownKind,
+      drawdownLimit,
+      drawdownFloor,
+      drawdownHwm
+    );
+    return new AccountContext(
+      status,
+      dailyLossLimit,
+      dailyLossFloor,
+      drawdown,
+      defaultLeverage,
+      leverageOverrides,
+      allowedInstruments
+    );
   }
 }
 

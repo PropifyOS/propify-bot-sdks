@@ -58,4 +58,19 @@ pnpm exec asc assembly/sample.ts \
 # deterministic filter; the module stays valid and loadable in wasmtime.
 wasm-tools strip -d producers "${raw_wasm}" -o "${out_wasm}"
 
+# OPTIONAL (ABI v3 bot manifest): AssemblyScript has no native link-section attribute, so a
+# real bot embeds its `propify_manifest` custom section AFTER this strip step with the
+# shared `manifest-encoder` tool (wasm-tools 1.252 has no add-custom-section subcommand).
+# The injected bytes are the canonical `BotManifest::encode` output, so the section is
+# byte-identical on rebuild and the artifact stays reproducible. Inject LAST (after the
+# `producers` strip) so the section bytes are deterministic. This sample ships no manifest,
+# so the step is documented here rather than executed; a bot build (for example the Trend
+# bot) runs:
+#
+#   cargo run -p manifest-encoder -- encode bot.manifest.json manifest.bin
+#   cargo run -p manifest-encoder -- inject "${out_wasm}" manifest.bin sample.with-manifest.wasm
+#   cargo run -p manifest-encoder -- verify sample.with-manifest.wasm
+#
+# See README.md ("Bot manifest") and tools/manifest-encoder/README.md.
+
 echo "build-repro (assemblyscript): wrote ${out_wasm}"

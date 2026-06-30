@@ -27,6 +27,7 @@ import {
   MarketWindow,
   StrategyParams,
   AccountView,
+  AccountContext,
   OrderIntentBody,
   Decimal,
   Exchange,
@@ -66,10 +67,12 @@ class SampleBot extends Bot {
     market: MarketSnapshot,
     window: MarketWindow,
     params: StrategyParams,
-    account: AccountView
+    account: AccountView,
+    context: AccountContext
   ): OrderIntentBody | null {
-    // The sample is a snapshot-only bot: it ignores the ABI v2 window and decides from
-    // the latest candle alone.
+    // The sample is a snapshot-only bot: it ignores the ABI v2 window and the ABI v3
+    // account context and decides from the latest candle alone. A real bot would consult
+    // `context` (the drawdown floor, leverage caps) to shape its own behaviour.
     // Take the order size from the `"quantity"` parameter when present, else the
     // fixed default. Looking it up by name keeps the bot deterministic and
     // independent of parameter ordering.
